@@ -1,1 +1,10 @@
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+# This board has an early ESP32-P4 rev v1.3 die; IDF defaults to rev3 silicon.
+# Enable pre-v3.0 support (mutually exclusive with >=3.0) and target rev v1.0.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# Make the USB-Serial/JTAG port (used for flashing/monitoring, e.g. COM3) the
+# primary console so it receives stdin too; the default UART0 console is
+# output-only for us here since nothing is wired to UART0's physical pins.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

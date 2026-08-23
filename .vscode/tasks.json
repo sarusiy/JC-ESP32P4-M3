@@ -1,0 +1,524 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "pio_upload_now",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"upload"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio_clean_now",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"clean"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio_upload_after_clean",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"upload"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_com3",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-c",
+				"import time,sys,serial;s=serial.Serial('COM3',115200,timeout=0.2);end=time.time()+8;buf=[]\nwhile time.time()<end:\n d=s.read(4096)\n if d: buf.append(d)\ns.close();sys.stdout.write((b''.join(buf)).decode('utf-8','replace'))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_com3_fixed",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-c",
+				"import time,sys,serial; s=serial.Serial(\"COM3\",115200,timeout=0.2); end=time.time()+8; buf=b\"\"; \nwhile time.time()<end: buf += s.read(4096)\ns.close(); sys.stdout.write(buf.decode(\"utf-8\",\"replace\"))"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_script",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"serial_probe.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_script_after_kill",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"serial_probe.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pyserial_check",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-c",
+				"import serial,sys; print(getattr(serial,'__file__',None)); print(hasattr(serial,'Serial')); print(serial.__dict__.keys())"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_diag",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"serial_probe.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "install_pyserial",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"pyserial"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "show_serial_pkg",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"show",
+				"serial"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "inspect_serial_mod",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"inspect_serial.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "list_serial_pkg_dir",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-ChildItem \"C:\\Users\\yossi\\.platformio\\penv\\Lib\\site-packages\\serial\" | Select-Object Name"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "reinstall_pyserial",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"--force-reinstall",
+				"--no-cache-dir",
+				"pyserial==3.5"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "repair_pyserial",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"--ignore-installed",
+				"--no-deps",
+				"pyserial==3.5"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "inspect_serial_mod_after_fix",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"inspect_serial.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "serial_probe_script_after_fix",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"serial_probe.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio_clean_oldplatform",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"clean"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "repair_penv_click",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"--upgrade",
+				"click",
+				"platformio"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "repair_penv_missing_deps",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pip",
+				"install",
+				"cryptography",
+				"reedsolo",
+				"rich_click"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check_pio_core",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"--version"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio_clean_old_release",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"clean"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio_verbose_fail_detail",
+			"type": "shell",
+			"command": "C:\\Users\\yossi\\.platformio\\penv\\Scripts\\pio.exe",
+			"args": [
+				"run",
+				"-e",
+				"jc_esp32p4_m3",
+				"-v"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-jc_esp32p4_m3",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-check",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"system",
+				"info"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-jc_esp32p4_m3-retry",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "list-esptoolpy-pkgs",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-ChildItem \"$env:USERPROFILE\\.platformio\\packages\" -Filter \"tool-esptoolpy*\" -Force | Select-Object Name,FullName | Format-Table -AutoSize | Out-String -Width 200"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "list-esptoolpy-contents",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-ChildItem \"$env:USERPROFILE\\.platformio\\packages\\tool-esptoolpy\" -Force | Select-Object Name | Format-Table -AutoSize | Out-String -Width 200"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-retry2",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "list-cmake-contents",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-ChildItem \"$env:USERPROFILE\\.platformio\\packages\\tool-cmake\" -Force -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -AutoSize | Out-String -Width 200"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "remove-corrupt-cmake",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Remove-Item \"$env:USERPROFILE\\.platformio\\packages\\tool-cmake\" -Recurse -Force -ErrorAction SilentlyContinue; Write-Output 'removed'"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-retry3",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-cmake-progress",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-ChildItem \"$env:USERPROFILE\\.platformio\\packages\\tool-cmake\" -Force -ErrorAction SilentlyContinue -Recurse | Measure-Object | Select-Object Count"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-python-procs",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='py.exe'\" | Select-Object ProcessId,CommandLine | Format-List | Out-String -Width 300"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-python-procs2",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-CimInstance -ClassName Win32_Process | Where-Object { $_.Name -match 'python' } | Select-Object ProcessId,CommandLine | Format-List | Out-String -Width 300"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-python-procs3",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-Command",
+				"Get-CimInstance -ClassName Win32_Process | Where-Object { $_.Name -like \"*python*\" } | Select-Object ProcessId,CommandLine | Format-List | Out-String -Width 300"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-final",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-final2",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-final3",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-build-final4",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-upload",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"run",
+				"-d",
+				"c:\\projects\\JC-ESP32P4-M3",
+				"-e",
+				"jc_esp32p4_m3",
+				"-t",
+				"upload",
+				"--upload-port",
+				"COM3"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "pio-monitor",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3.11",
+				"-m",
+				"platformio",
+				"device",
+				"monitor",
+				"-p",
+				"COM3",
+				"-b",
+				"115200"
+			],
+			"isBackground": true
+		}
+	]
+}
