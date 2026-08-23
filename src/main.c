@@ -1,8 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "tinyusb.h"
+#include "tinyusb_cdc_acm.h"
+#include "tinyusb_default_config.h"
 
 #ifndef LED_GPIO
 #define LED_GPIO 2
@@ -11,7 +15,7 @@
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
 
-/* Half-period of the blink, in ms; changed live from the serial console. */
+/* Half-period of the blink, in ms; changed live from the control channel. */
 static volatile uint32_t blink_half_period_ms = 500;
 
 static void init_led(void)
@@ -26,47 +30,104 @@ static void init_led(void)
     gpio_config(&io_conf);
 }
 
-/* Reads blink half-period updates (ms) typed into the serial monitor. */
-static void console_task(void *arg)
+static void cdc_send(const char *msg)
 {
-    (void)arg;
-    char digits[16];
-    size_t len = 0;
+    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)msg, strlen(msg));
+    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+}
 
-    /* stdin is fully buffered by default; disable that so getchar() sees
-       each byte immediately instead of waiting for the buffer to fill. */
-    setvbuf(stdin, NULL, _IONBF, 0);
+static void send_menu(void)
+{
+    char menu[220];
+    snprintf(menu, sizeof(menu),
+             "\r\n=== JC-ESP32P4-M3 control channel ===\r\n"
+             "freq <ms>  set blink half-period, %d-%d ms (current: %lu). Example: freq 250\r\n"
+             "help       show this menu\r\n",
+             BLINK_HALF_PERIOD_MIN_MS, BLINK_HALF_PERIOD_MAX_MS,
+             (unsigned long)blink_half_period_ms);
+    cdc_send(menu);
+}
 
-    printf("Type a number (%d-%d) + Enter to set the blink half-period in ms.\n",
-           BLINK_HALF_PERIOD_MIN_MS, BLINK_HALF_PERIOD_MAX_MS);
+/* Parses "freq <ms>" / "help" typed into the control channel. */
+static void handle_command(char *line)
+{
+    char msg[96];
 
-    while (1) {
-        int c = getchar();
-
-        if (c == '\r' || c == '\n') {
-            if (len == 0) {
-                continue;
-            }
-            digits[len] = '\0';
-            len = 0;
-
-            char *endptr = NULL;
-            long value = strtol(digits, &endptr, 10);
-            if (endptr == digits || value < BLINK_HALF_PERIOD_MIN_MS || value > BLINK_HALF_PERIOD_MAX_MS) {
-                printf("Invalid input. Enter a number of ms (%d-%d).\n",
-                       BLINK_HALF_PERIOD_MIN_MS, BLINK_HALF_PERIOD_MAX_MS);
-                continue;
-            }
-
+    if (strncmp(line, "freq ", 5) == 0) {
+        char *endptr = NULL;
+        long value = strtol(line + 5, &endptr, 10);
+        if (endptr == line + 5 || *endptr != '\0' ||
+            value < BLINK_HALF_PERIOD_MIN_MS || value > BLINK_HALF_PERIOD_MAX_MS) {
+            snprintf(msg, sizeof(msg), "ERR invalid value. Enter a number of ms (%d-%d).\r\n",
+                     BLINK_HALF_PERIOD_MIN_MS, BLINK_HALF_PERIOD_MAX_MS);
+        } else {
             blink_half_period_ms = (uint32_t)value;
-            printf("Blink half-period set to %ld ms\n", value);
-        } else if (c >= '0' && c <= '9' && len < sizeof(digits) - 1) {
-            digits[len++] = (char)c;
-        } else if (c < 0) {
-            /* No input available right now; avoid busy-looping. */
-            vTaskDelay(pdMS_TO_TICKS(20));
+            snprintf(msg, sizeof(msg), "OK freq=%ld ms\r\n", value);
+        }
+        cdc_send(msg);
+    } else if (strcmp(line, "help") == 0) {
+        send_menu();
+    } else if (strlen(line) > 0) {
+        snprintf(msg, sizeof(msg), "ERR unknown command '%s'. Type 'help'.\r\n", line);
+        cdc_send(msg);
+    }
+}
+
+static void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
+{
+    static char line[16];
+    static size_t line_len = 0;
+
+    uint8_t buf[64];
+    size_t rx_size = 0;
+
+    if (tinyusb_cdcacm_read(itf, buf, sizeof(buf), &rx_size) != ESP_OK) {
+        return;
+    }
+
+    for (size_t i = 0; i < rx_size; i++) {
+        char c = (char)buf[i];
+        if (c == '\r' || c == '\n') {
+            line[line_len] = '\0';
+            handle_command(line);
+            line_len = 0;
+        } else if (line_len < sizeof(line) - 1) {
+            line[line_len++] = c;
         }
     }
+}
+
+static void tinyusb_cdc_line_state_callback(int itf, cdcacm_event_t *event)
+{
+    if (event->line_state_changed_data.dtr) {
+        send_menu();
+    }
+}
+
+/* Fallback in case a terminal's DTR toggle isn't caught in time to show the menu. */
+static void control_channel_banner_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    send_menu();
+    vTaskDelete(NULL);
+}
+
+/* Independent USB-CDC control channel on the board's second USB-C port. */
+static void start_control_channel(void)
+{
+    tinyusb_config_t tusb_cfg = TINYUSB_CONFIG_HIGH_SPEED(NULL, NULL);
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+
+    const tinyusb_config_cdcacm_t acm_cfg = {
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .callback_rx = &tinyusb_cdc_rx_callback,
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = &tinyusb_cdc_line_state_callback,
+        .callback_line_coding_changed = NULL,
+    };
+    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
+
+    xTaskCreate(control_channel_banner_task, "usb_banner", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 
 void app_main(void)
@@ -75,7 +136,7 @@ void app_main(void)
 
     printf("JC-ESP32P4-M3 booted. Blinking LED on GPIO %d\n", LED_GPIO);
 
-    xTaskCreate(console_task, "console", 4096, NULL, 5, NULL);
+    start_control_channel();
 
     uint32_t count = 0;
     while (1) {

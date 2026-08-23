@@ -8,3 +8,7 @@ CONFIG_ESP32P4_REV_MIN_100=y
 # primary console so it receives stdin too; the default UART0 console is
 # output-only for us here since nothing is wired to UART0's physical pins.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Enable TinyUSB CDC on the board's second (full-speed) USB-C port, used as
+# an independent control channel separate from the debug console above.
+CONFIG_TINYUSB_CDC_ENABLED=y

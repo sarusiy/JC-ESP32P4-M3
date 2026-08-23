@@ -10,3 +10,7 @@ sdkconfig.*
 
 # Unrelated reference/asset dump (contains copyrighted ROMs); exclude from VCS.
 MakersCourse_6_2026/
+
+# Fetched by the ESP-IDF Component Manager; large generated trees, not source.
+managed_components/
+dependencies.lock
