@@ -9,7 +9,7 @@
 #include "tinyusb_default_config.h"
 
 #ifndef LED_GPIO
-#define LED_GPIO 2
+#define LED_GPIO 28
 #endif
 
 #define BLINK_HALF_PERIOD_MIN_MS 10
@@ -143,11 +143,11 @@ void app_main(void)
         uint32_t half_period = blink_half_period_ms;
 
         gpio_set_level(LED_GPIO, 1);
-        printf("LED ON  (tick %lu)\n", (unsigned long)count);
+        printf("ON\n");
         vTaskDelay(pdMS_TO_TICKS(half_period));
 
         gpio_set_level(LED_GPIO, 0);
-        printf("LED OFF (tick %lu)\n", (unsigned long)count);
+        printf("OFF\n");
         vTaskDelay(pdMS_TO_TICKS(half_period));
 
         count++;
