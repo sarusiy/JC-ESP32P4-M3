@@ -14,3 +14,6 @@ MakersCourse_6_2026/
 # Fetched by the ESP-IDF Component Manager; large generated trees, not source.
 managed_components/
 dependencies.lock
+
+# Large binary docs (multi-GB workshop manuals); keep local only, too big for GitHub.
+Doc/**/*.zip
