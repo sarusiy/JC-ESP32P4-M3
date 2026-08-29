@@ -106,15 +106,22 @@ Expected serial monitor logs:
 
 ```text
 BLE cmd 'freq 250' -> OK
+Blink half-period set to 250 ms
 ```
 
-The same result is sent to BLE response characteristic `0xFFF2` as UTF-8 text, for example `OK freq=250 ms`.
+The same `freq <ms>` parser and this debug logging style is shared by all three control paths (USB CDC, BLE, and the Wi-Fi HTTP API below), each tagged with its source (`USB cmd ...`, `BLE cmd ...`, `HTTP cmd ...`). The result is also sent to BLE response characteristic `0xFFF2` as UTF-8 text, for example `OK freq=250 ms`.
 
 Invalid examples such as `freq 5`, `freq 70000`, or `hello` are rejected by the shared parser.
 
 ## Wi-Fi status
 
-The ESP-Hosted SDIO Wi-Fi transport is up and the C6 reports WLAN support. CarTheftGuard provisions Wi-Fi credentials over BLE characteristic `0xFFF3` using an UTF-8 payload of `SSID`, newline, then password. The board reports `WiFi connected ip=<address>` over response characteristic `0xFFF2` after joining the network.
+The ESP-Hosted SDIO Wi-Fi transport is up and validated end-to-end on hardware: CarTheftGuard provisions Wi-Fi credentials over BLE characteristic `0xFFF3` using a UTF-8 payload of `SSID`, newline, then password. The board joins the network, gets a DHCP IP, and reports `WiFi connected ip=<address>` over response characteristic `0xFFF2`.
+
+Three fixes were required to get this reliable (see `Doc/AGENT_PROGRESS.md` for full detail):
+
+- **`src/idf_component.yml` pins `espressif/esp_hosted: "^2.12.8"`.** The older `<2.6.0` (2.0.17) host library has a heap-corruption bug in its SDIO driver that crash-loops the board within seconds of boot. Do not downgrade this.
+- **`esp_netif_create_default_wifi_sta()` is required** in `start_hosted_wifi_link()`. Without it the STA can associate at L2 but never gets a DHCP-assigned IP.
+- **Each Wi-Fi connect attempt does a full `esp_wifi_stop()` / `esp_wifi_set_mode()` / `esp_wifi_set_config()` / `esp_wifi_start()` cycle before `esp_wifi_connect()`** in `start_wifi_connection()`. ESP-Hosted's internal netif "started" latch can get stuck after the STA has been up once, silently blocking DHCP on a later reconnect with no error reported.
 
 Once connected, the board exposes this local-LAN endpoint for frequency control:
 

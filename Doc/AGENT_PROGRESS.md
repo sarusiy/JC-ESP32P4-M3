@@ -94,3 +94,16 @@
     - `0xFFF2` notification display still needs one phone-side valid/invalid command confirmation.
   - Next step:
     - Begin BLE-based Wi-Fi credential provisioning and connection status reporting.
+
+- 2026-08-29 (local): Wi-Fi provisioning crash-loop and no-IP bugs fixed; full flow validated end-to-end.
+  - Symptom: board crash-looped every ~3-4s with `assert failed: tlsf_free tlsf.c:630 (!block_is_free(block) && "block already marked as free")`, a double-free in the vendor ESP-Hosted SDIO driver (`sdio_process_rx_task`), during the earliest WiFi-transport bring-up. Reproduced with BLE on/off, SDIO clock 20/40MHz, RX streaming/none, full power cycle, and full flash erase — none of those changed anything.
+  - Root cause found by comparing against a public reference project for the exact same board module (Guition JC4880P443C / JC-ESP32P4-M3): `https://github.com/giltal/ESP32P4_Guition4_7_Project`. Their host pins `espressif/esp_hosted` to `^2.12.8`; ours was pinned to `<2.6.0` (resolved 2.0.17), an old host library version with this bug.
+  - Fix 1 (`src/idf_component.yml`): bumped `espressif/esp_hosted` to `^2.12.8` (resolves 2.12.12). No `main.c` changes needed for this part; confirmed stable for 100+ boot cycles afterward. Commit `06550b6`.
+  - Fix 2 (`src/main.c`): after the crash was fixed, Wi-Fi still joined but never got an IP (stuck at "OK WiFi connecting" forever, no error). Two bugs:
+    - Missing `esp_netif_create_default_wifi_sta()` — no netif meant no DHCP client at all.
+    - ESP-Hosted's netif "started" latch can get stuck after the STA has been up once, so a *second* `esp_wifi_connect()` associates but DHCP silently never runs again. Fixed with a full `esp_wifi_stop()` -> `set_mode` -> `set_config` -> `esp_wifi_start()` -> 300ms delay -> `esp_wifi_connect()` cycle on every connect attempt. This exact bug/fix is also documented in the reference project's `bsp_wifi.c`. Commit `6c3f670`.
+  - Fix 3 (`src/main.c`): added debug `printf` logging for command processing on all three control paths (USB, BLE, HTTP) and for the actual frequency value change, to make future diagnosis faster. Commit `8a45dbb`.
+  - Confirmed on hardware: full flow BLE scan -> connect -> Wi-Fi provision -> DHCP IP -> `POST /api/frequency` -> LED blink rate changes, all working end-to-end.
+  - Also confirmed our board's actual C6 co-processor firmware version is 2.3.0 (visible via the newer host library's `Version mismatch: Host [x] > Co-proc [2.3.0]` log line, which doesn't exist in host 2.0.17).
+  - Notes for future debugging kept in `/memories/repo/esp-hosted-crash-fix.md`: the board exposes direct UART header pins for the C6 co-processor (`connector pinout list.jpeg`: C6_U0RXD, C6_U0TXD, C6_IO9 boot-strap, C6_CHIP_PU reset) for directly reflashing the C6 slave firmware if ever needed, bypassing SDIO/WiFi entirely; and `esp_hosted_get_coprocessor_fwversion()` is a cheap non-destructive way to query the C6's actual firmware version over the existing transport, no WiFi needed.
+  - Next step: none pending on firmware; feature is complete and validated. Future: consider HTTPS/auth on the frequency API before untrusted-network use.
