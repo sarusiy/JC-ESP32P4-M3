@@ -59,6 +59,7 @@ static bool apply_freq_command(const char *line, char *out_msg, size_t out_msg_l
     }
 
     blink_half_period_ms = (uint32_t)value;
+    printf("Blink half-period set to %ld ms\n", value);
     snprintf(out_msg, out_msg_len, "OK freq=%ld ms\r\n", value);
     return true;
 }
@@ -101,7 +102,8 @@ static void handle_command(char *line)
     if (strcmp(line, "help") == 0) {
         send_menu();
     } else if (strlen(line) > 0) {
-        apply_freq_command(line, msg, sizeof(msg));
+        bool ok = apply_freq_command(line, msg, sizeof(msg));
+        printf("USB cmd '%s' -> %s", line, ok ? "OK\n" : "ERR\n");
         cdc_send(msg);
     }
 }
@@ -185,6 +187,7 @@ static esp_err_t frequency_http_handler(httpd_req_t *request)
 
     command[received] = '\0';
     bool accepted = apply_freq_command(command, response, sizeof(response));
+    printf("HTTP cmd '%s' -> %s", command, accepted ? "OK\n" : "ERR\n");
     httpd_resp_set_type(request, "text/plain");
     httpd_resp_sendstr(request, response);
     return accepted ? ESP_OK : ESP_FAIL;
