@@ -68,6 +68,7 @@ CarTheftGuard subscribes to `0xFFF2` and shows the response after each write.
 - Runtime log confirms C6 features: WLAN, HCI over SDIO, BLE only.
 - Hosted NimBLE VHCI is enabled and BLE advertises as `JC-P4-C6`.
 - Android phone connection to service `0xFFF0` is confirmed.
+- CarTheftGuard scan, connection, frequency write, and visible GPIO 28 LED timing change are confirmed on an Android phone.
 
 ## Firmware work plan
 
@@ -85,18 +86,18 @@ CarTheftGuard subscribes to `0xFFF2` and shows the response after each write.
 
 In `sarusiy/CarTheftGuard`:
 
-1. Inspect the existing Android project structure and minimum SDK.
-2. Add BLE scan and device connection handling.
-3. Discover service `0xFFF0` and write characteristic `0xFFF1`.
-4. Add the first GUI screen with:
+1. Done: create the CarTheftGuard Android project and configure minimum SDK 26.
+2. Done: add BLE scan and device connection handling.
+3. Done: discover service `0xFFF0` and write characteristic `0xFFF1`.
+4. Done: add the first GUI screen with:
    - Connection status
    - Scan/connect action
    - Frequency input or slider
    - Send/apply action
    - Current command result or validation error
-5. Send `freq <ms>` as UTF-8 text to the board.
-6. Subscribe to `0xFFF2` and display the board's actual `OK`/`ERR` response.
-7. Test reconnect behavior and Android Bluetooth permission handling.
+5. Done: send `freq <ms>` as UTF-8 text to the board.
+6. Done: subscribe to `0xFFF2` and display the board's actual `OK`/`ERR` response.
+7. In progress: test reconnect behavior, runtime permissions, and `0xFFF2` notification display on the phone.
 
 ## Open decisions
 
@@ -112,7 +113,7 @@ In `sarusiy/CarTheftGuard`:
 - The hosted P4-to-C6 radio path is identified and operational.
 - Wi-Fi hosted transport initializes without breaking the existing application.
 - BLE advertises and accepts a connection from Android BLE tools.
-- The Android GUI can set a valid LED half-period.
+- The Android GUI can set a valid LED half-period; this is confirmed on hardware.
 - Invalid values are rejected by both firmware and the GUI.
 - GPIO 28 visibly blinks at the selected timing.
 - USB CDC control remains available for diagnostics.

@@ -81,3 +81,16 @@
     - Validate multiple valid/invalid BLE frequency writes.
     - Commit and push the ESP-IDF hosted baseline.
     - Build the dedicated Android app UI for scan/connect/frequency control in `C:\projects\CarTheftGuard` from `git@github.com:sarusiy/CarTheftGuard.git`.
+
+- 2026-08-29 (local): Android BLE control milestone.
+  - Completed:
+    - CarTheftGuard scans and finds the advertising board from an Android phone.
+    - Android connects to `JC-P4-C6`, discovers service `0xFFF0`, and writes `freq <ms>` to `0xFFF1`.
+    - Valid Android frequency commands update both firmware state and the GPIO 28 LED blink timing.
+    - CarTheftGuard v0.1.2 lists nearby BLE scan results and includes the `0xFFF2` response-notification client.
+    - Firmware `0xFFF2` response read/notify support was built and flashed to COM3.
+  - Current state:
+    - End-to-end Android BLE LED control is validated.
+    - `0xFFF2` notification display still needs one phone-side valid/invalid command confirmation.
+  - Next step:
+    - Begin BLE-based Wi-Fi credential provisioning and connection status reporting.
