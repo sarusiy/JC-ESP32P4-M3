@@ -114,9 +114,16 @@ Invalid examples such as `freq 5`, `freq 70000`, or `hello` are rejected by the 
 
 ## Wi-Fi status
 
-The ESP-Hosted SDIO Wi-Fi transport is up and the C6 reports WLAN support. The current firmware initializes and starts the hosted Wi-Fi station interface, but it does not yet join an access point because Wi-Fi credentials/provisioning are not implemented.
+The ESP-Hosted SDIO Wi-Fi transport is up and the C6 reports WLAN support. CarTheftGuard provisions Wi-Fi credentials over BLE characteristic `0xFFF3` using an UTF-8 payload of `SSID`, newline, then password. The board reports `WiFi connected ip=<address>` over response characteristic `0xFFF2` after joining the network.
 
-The next Wi-Fi feature should use the working BLE connection to provision SSID/password, then report connection status and IP address back to the Android app.
+Once connected, the board exposes this local-LAN endpoint for frequency control:
+
+```text
+POST http://<board-ip>/api/frequency
+Body: freq <ms>
+```
+
+The endpoint is intended for a trusted local network during development. Add authentication and HTTPS before deploying it on an untrusted network.
 
 ## LED pin
 

@@ -7,6 +7,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_http_server.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_hosted.h"
@@ -33,6 +34,12 @@
 
 /* Half-period of the blink, in ms; changed live from the control channel. */
 static volatile uint32_t blink_half_period_ms = 500;
+static bool wifi_started;
+static httpd_handle_t http_server;
+
+#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+static void ble_publish_response(uint16_t conn_handle, const char *message);
+#endif
 
 /* Shared command parser used by USB CDC and future companion transport. */
 static bool apply_freq_command(const char *line, char *out_msg, size_t out_msg_len)
@@ -165,6 +172,93 @@ static void start_control_channel(void)
     xTaskCreate(control_channel_banner_task, "usb_banner", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 
+static esp_err_t frequency_http_handler(httpd_req_t *request)
+{
+    char command[64] = {0};
+    int received = httpd_req_recv(request, command, sizeof(command) - 1);
+    char response[96];
+
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected freq <ms>");
+        return ESP_FAIL;
+    }
+
+    command[received] = '\0';
+    bool accepted = apply_freq_command(command, response, sizeof(response));
+    httpd_resp_set_type(request, "text/plain");
+    httpd_resp_sendstr(request, response);
+    return accepted ? ESP_OK : ESP_FAIL;
+}
+
+static void start_frequency_http_server(void)
+{
+    if (http_server != NULL) {
+        return;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_uri_t frequency_uri = {
+        .uri = "/api/frequency",
+        .method = HTTP_POST,
+        .handler = frequency_http_handler,
+    };
+
+    if (httpd_start(&http_server, &config) == ESP_OK) {
+        httpd_register_uri_handler(http_server, &frequency_uri);
+        printf("WiFi frequency API ready: POST /api/frequency\n");
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    (void)arg;
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = event_data;
+        char address[16];
+        esp_ip4addr_ntoa(&event->ip_info.ip, address, sizeof(address));
+        printf("WiFi connected, IP: %s\n", address);
+        start_frequency_http_server();
+#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+        char response[64];
+        snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", address);
+        ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
+#endif
+    }
+}
+
+static bool start_wifi_connection(const char *ssid, const char *password, char *response, size_t response_len)
+{
+    if (!wifi_started) {
+        snprintf(response, response_len, "ERR WiFi is not ready\r\n");
+        return false;
+    }
+
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    if (ssid_len == 0 || ssid_len > 32 || password_len < 8 || password_len > 63) {
+        snprintf(response, response_len, "ERR invalid WiFi credentials\r\n");
+        return false;
+    }
+
+    wifi_config_t config = {0};
+    memcpy(config.sta.ssid, ssid, ssid_len);
+    memcpy(config.sta.password, password, password_len);
+    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (err == ESP_OK) {
+        err = esp_wifi_connect();
+    }
+    if (err != ESP_OK) {
+        snprintf(response, response_len, "ERR WiFi connect failed: %s\r\n", esp_err_to_name(err));
+        return false;
+    }
+
+    snprintf(response, response_len, "OK WiFi connecting\r\n");
+    return true;
+}
+
 #if defined(CONFIG_ESP_HOSTED_ENABLED) && CONFIG_ESP_HOSTED_ENABLED
 static void start_hosted_wifi_link(void)
 {
@@ -192,6 +286,8 @@ static void start_hosted_wifi_link(void)
         return;
     }
 
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
@@ -211,6 +307,7 @@ static void start_hosted_wifi_link(void)
         return;
     }
 
+    wifi_started = true;
     printf("Hosted radio link is up (P4 host, C6 co-processor).\n");
 }
 #else
@@ -224,10 +321,14 @@ static void start_hosted_wifi_link(void)
 #define BLE_COMPANION_SERVICE_UUID 0xFFF0
 #define BLE_COMPANION_CHAR_UUID    0xFFF1
 #define BLE_RESPONSE_CHAR_UUID     0xFFF2
+#define BLE_WIFI_CONFIG_CHAR_UUID  0xFFF3
 
 static uint8_t s_ble_addr_type = 0;
 static uint16_t s_ble_response_handle;
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static char s_ble_response[96] = "Ready\r\n";
+
+static void ble_start_advertising(void);
 
 static int ble_response_read_cb(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -246,10 +347,40 @@ static int ble_response_read_cb(uint16_t conn_handle, uint16_t attr_handle,
 static void ble_publish_response(uint16_t conn_handle, const char *message)
 {
     snprintf(s_ble_response, sizeof(s_ble_response), "%s", message);
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        conn_handle = s_ble_conn_handle;
+    }
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
     int rc = ble_gatts_notify(conn_handle, s_ble_response_handle);
     if (rc != 0) {
         printf("BLE response notify not sent: rc=%d\n", rc);
     }
+}
+
+static int ble_wifi_config_write_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)attr_handle;
+    (void)arg;
+    char credentials[98] = {0};
+    uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+    if (length >= sizeof(credentials) || ble_hs_mbuf_to_flat(ctxt->om, credentials, length, NULL) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    credentials[length] = '\0';
+
+    char *password = strchr(credentials, '\n');
+    char response[96];
+    if (password == NULL) {
+        snprintf(response, sizeof(response), "ERR WiFi format is ssid\\npassword\r\n");
+    } else {
+        *password++ = '\0';
+        start_wifi_connection(credentials, password, response, sizeof(response));
+    }
+    ble_publish_response(conn_handle, response);
+    return 0;
 }
 
 static int ble_freq_write_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -293,11 +424,28 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .val_handle = &s_ble_response_handle,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
+            {
+                .uuid = BLE_UUID16_DECLARE(BLE_WIFI_CONFIG_CHAR_UUID),
+                .access_cb = ble_wifi_config_write_cb,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            },
             {0},
         },
     },
     {0},
 };
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type == BLE_GAP_EVENT_CONNECT && event->connect.status == 0) {
+        s_ble_conn_handle = event->connect.conn_handle;
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        ble_start_advertising();
+    }
+    return 0;
+}
 
 static void ble_start_advertising(void)
 {
@@ -317,7 +465,7 @@ static void ble_start_advertising(void)
     struct ble_gap_adv_params adv = {0};
     adv.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, NULL, NULL);
+    rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, ble_gap_event, NULL);
     if (rc != 0) {
         printf("BLE adv start failed: rc=%d\n", rc);
         return;

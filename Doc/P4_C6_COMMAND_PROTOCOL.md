@@ -14,6 +14,8 @@ commands are handled by the P4 firmware, not by a separate user C6 application.
 - Characteristic properties: write and write-without-response
 - Response characteristic UUID: `0xFFF2`
 - Response properties: read and notify
+- Wi-Fi configuration characteristic UUID: `0xFFF3`
+- Wi-Fi configuration properties: write
 - Payload encoding: ASCII/UTF-8 text
 
 ## Command set v0
@@ -41,6 +43,21 @@ The ESP-IDF serial monitor also logs whether the write was accepted or rejected.
 - Newline is optional for BLE writes.
 - USB CDC still accepts line-based commands with `\r` or `\n` terminators.
 - Maximum BLE command payload currently fits in the firmware's 63-byte command buffer.
+
+## Wi-Fi provisioning and control
+
+`0xFFF3` accepts one UTF-8 payload in this format:
+
+```text
+SSID\npassword
+```
+
+The board responds first with `OK WiFi connecting`, then reports `WiFi connected ip=<address>` on `0xFFF2` after it gets an address. Frequency control then moves to the local network:
+
+```text
+POST http://<board-ip>/api/frequency
+Body: freq <ms>
+```
 
 ## Current implementation status
 
