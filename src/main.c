@@ -258,8 +258,23 @@ static bool start_wifi_connection(const char *ssid, const char *password, char *
     memcpy(config.sta.password, password, password_len);
     config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    /*
+     * ESP-Hosted's netif "started" latch can get stuck false after the STA
+     * was already up once, so a later esp_wifi_connect() associates but
+     * WIFI_EVENT_STA_CONNECTED never reaches esp_netif: DHCP never runs and
+     * no IP ever arrives, with no error either. A stop/start cycle clears
+     * that latch unconditionally before each connect attempt.
+     */
+    esp_wifi_stop();
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(300));
         err = esp_wifi_connect();
     }
     if (err != ESP_OK) {
@@ -295,6 +310,12 @@ static void start_hosted_wifi_link(void)
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         printf("WiFi event loop init failed: %s\n", esp_err_to_name(err));
+        return;
+    }
+
+    /* Without this, the STA associates but never gets a netif/DHCP client, so it never gets an IP. */
+    if (esp_netif_create_default_wifi_sta() == NULL) {
+        printf("WiFi STA netif create failed\n");
         return;
     }
 
@@ -373,9 +394,11 @@ static void ble_publish_response(uint16_t conn_handle, const char *message)
         conn_handle = s_ble_conn_handle;
     }
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        printf("BLE response not sent (no active connection): %s", message);
         return;
     }
     int rc = ble_gatts_notify(conn_handle, s_ble_response_handle);
+    printf("BLE notify conn_handle=%d rc=%d: %s", (int)conn_handle, rc, message);
     if (rc != 0) {
         printf("BLE response notify not sent: rc=%d\n", rc);
     }
