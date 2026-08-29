@@ -12,6 +12,8 @@ commands are handled by the P4 firmware, not by a separate user C6 application.
 - Service UUID: `0xFFF0`
 - Command characteristic UUID: `0xFFF1`
 - Characteristic properties: write and write-without-response
+- Response characteristic UUID: `0xFFF2`
+- Response properties: read and notify
 - Payload encoding: ASCII/UTF-8 text
 
 ## Command set v0
@@ -22,20 +24,16 @@ commands are handled by the P4 firmware, not by a separate user C6 application.
 
 ## Response set v0
 
-The current BLE characteristic is write-only from the Android user's point of
-view. Responses are visible in the ESP-IDF serial monitor and by observing the
-LED timing.
+After each command, the firmware sends the result as a UTF-8 notification on
+`0xFFF2`. The latest result can also be read from that characteristic.
 
-Expected monitor messages:
+Expected responses:
 
-- `BLE cmd 'freq=<ms>' -> OK` for accepted writes
-- `BLE cmd '<payload>' -> ERR` for invalid writes
+- `OK freq=<ms> ms` for accepted writes
+- `ERR invalid value. Enter a number of ms (10-60000).` for invalid ranges
+- `ERR unknown command '<cmd>'. Type 'help'.` for unknown commands
 
-The shared parser internally formats these response strings:
-
-- `OK freq=<ms> ms`
-- `ERR invalid value. Enter a number of ms (10-60000).`
-- `ERR unknown command '<cmd>'. Type 'help'.`
+The ESP-IDF serial monitor also logs whether the write was accepted or rejected.
 
 ## Transport framing
 
@@ -51,10 +49,9 @@ The shared parser internally formats these response strings:
 - ESP-Hosted SDIO link to the onboard C6 is operational.
 - Hosted NimBLE VHCI is enabled; BLE advertises as `JC-P4-C6`.
 - Android phone discovery and connection to service `0xFFF0` are confirmed.
+- The firmware exposes `0xFFF2` for board response read/notify.
 
 ## Next TODO
 
-1. Validate several valid and invalid `freq` writes from Android.
-2. Add optional response characteristic `0xFFF2` with read/notify support.
-3. Build the Android app screen that scans, connects, and writes `freq <ms>`.
-4. Add BLE-based Wi-Fi provisioning after LED control is stable.
+1. Validate several valid and invalid `freq` writes and `0xFFF2` notifications from Android.
+2. Add BLE-based Wi-Fi provisioning after LED control is stable.

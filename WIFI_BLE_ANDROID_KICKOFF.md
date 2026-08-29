@@ -20,7 +20,7 @@ The first Android milestone is a GUI control that changes the LED blink half-per
 - Framework: native ESP-IDF
 - LED: GPIO 28
 - Existing control: USB CDC serial command `freq <ms>`
-- BLE control: advertised device `JC-P4-C6`, service `0xFFF0`, write characteristic `0xFFF1`
+- BLE control: advertised device `JC-P4-C6`, service `0xFFF0`, command characteristic `0xFFF1`, response characteristic `0xFFF2`
 - Valid half-period: 10 to 60000 ms
 - Existing status output: `ON` and `OFF`
 - P4 debug/control port used by this workspace: COM3
@@ -56,9 +56,9 @@ The firmware exposes one custom GATT service with one writable characteristic fo
 - Frequency characteristic UUID: `0xFFF1`
 - Write format: ASCII `freq <ms>` initially, matching the USB command
 - Accepted values: 10 to 60000 ms
-- Current response path: serial monitor log and visible LED timing change
+- Response characteristic UUID: `0xFFF2` (read and notify UTF-8 response text)
 
-The next firmware improvement is an optional response characteristic, for example `0xFFF2`, using read/notify for `OK` and `ERR` text responses.
+CarTheftGuard subscribes to `0xFFF2` and shows the response after each write.
 
 ## Confirmed hardware/runtime status
 
@@ -78,7 +78,7 @@ The next firmware improvement is an optional response characteristic, for exampl
 5. Done: start hosted Wi-Fi transport and station interface.
 6. Done: keep USB CDC control working as a diagnostic fallback.
 7. Done: print hosted, BLE, and command validation events to the debug console.
-8. In progress: verify multiple BLE frequency writes and invalid command handling on hardware.
+8. Done: notify the Android client with the accepted/rejected command result on `0xFFF2`.
 9. Next: add Wi-Fi credential provisioning and connection status reporting.
 
 ## Android work plan
@@ -95,17 +95,17 @@ In `sarusiy/CarTheftGuard`:
    - Send/apply action
    - Current command result or validation error
 5. Send `freq <ms>` as UTF-8 text to the board.
-6. Display write success/failure clearly; later read/subscribe to response characteristic `0xFFF2` once firmware adds it.
+6. Subscribe to `0xFFF2` and display the board's actual `OK`/`ERR` response.
 7. Test reconnect behavior and Android Bluetooth permission handling.
 
 ## Open decisions
 
 - Wi-Fi provisioning is a later feature after BLE LED control is stable.
-- BLE service/characteristic UUIDs are currently `0xFFF0` and `0xFFF1`.
+- BLE service/characteristic UUIDs are `0xFFF0`, `0xFFF1` (command), and `0xFFF2` (response).
 - Decide whether frequency values represent half-period milliseconds or full blink-cycle frequency.
 - Confirm the desired Android minimum SDK and supported Android versions.
 - Board advertises fixed name `JC-P4-C6`.
-- Decide whether BLE responses use a new `0xFFF2` notify/read characteristic or write-only status in the Android UI.
+- Validate the `0xFFF2` notification path with valid and invalid Android commands.
 
 ## Definition of done for the kickoff milestone
 

@@ -89,6 +89,7 @@ Use nRF Connect on Android to validate the current BLE control path:
 2. Connect to the device.
 3. Open service `0xFFF0`.
 4. Write text to characteristic `0xFFF1`.
+5. Subscribe to characteristic `0xFFF2` to receive the board's `OK` or `ERR` response.
 
 Valid writes are ASCII text commands:
 
@@ -106,6 +107,8 @@ Expected serial monitor logs:
 ```text
 BLE cmd 'freq 250' -> OK
 ```
+
+The same result is sent to BLE response characteristic `0xFFF2` as UTF-8 text, for example `OK freq=250 ms`.
 
 Invalid examples such as `freq 5`, `freq 70000`, or `hello` are rejected by the shared parser.
 

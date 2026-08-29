@@ -223,8 +223,34 @@ static void start_hosted_wifi_link(void)
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 #define BLE_COMPANION_SERVICE_UUID 0xFFF0
 #define BLE_COMPANION_CHAR_UUID    0xFFF1
+#define BLE_RESPONSE_CHAR_UUID     0xFFF2
 
 static uint8_t s_ble_addr_type = 0;
+static uint16_t s_ble_response_handle;
+static char s_ble_response[96] = "Ready\r\n";
+
+static int ble_response_read_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    return os_mbuf_append(ctxt->om, s_ble_response, strlen(s_ble_response)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static void ble_publish_response(uint16_t conn_handle, const char *message)
+{
+    snprintf(s_ble_response, sizeof(s_ble_response), "%s", message);
+    int rc = ble_gatts_notify(conn_handle, s_ble_response_handle);
+    if (rc != 0) {
+        printf("BLE response notify not sent: rc=%d\n", rc);
+    }
+}
 
 static int ble_freq_write_cb(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -247,6 +273,7 @@ static int ble_freq_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     char msg[96];
     bool ok = apply_freq_command(cmd, msg, sizeof(msg));
     printf("BLE cmd '%s' -> %s", cmd, ok ? "OK\n" : "ERR\n");
+    ble_publish_response(conn_handle, msg);
     return 0;
 }
 
@@ -259,6 +286,12 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .uuid = BLE_UUID16_DECLARE(BLE_COMPANION_CHAR_UUID),
                 .access_cb = ble_freq_write_cb,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(BLE_RESPONSE_CHAR_UUID),
+                .access_cb = ble_response_read_cb,
+                .val_handle = &s_ble_response_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
             {0},
         },
