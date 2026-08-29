@@ -308,6 +308,15 @@ static void start_hosted_wifi_link(void)
         return;
     }
 
+    /* Default country setting only scans channels 1-11; many routers (EU/IL) use 12-13. */
+    wifi_country_t country = {
+        .cc = "01",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+    };
+    esp_wifi_set_country(&country);
+
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
         printf("WiFi set mode failed: %s\n", esp_err_to_name(err));
