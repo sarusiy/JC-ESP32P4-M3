@@ -224,6 +224,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", address);
         ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
 #endif
+        return;
+    }
+
+    /* Without this, a failed join (bad password, AP out of range) leaves the app waiting forever. */
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = event_data;
+        printf("WiFi disconnected, reason: %d\n", event->reason);
+#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+        char response[64];
+        snprintf(response, sizeof(response), "ERR WiFi disconnected reason=%d\r\n", event->reason);
+        ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
+#endif
     }
 }
 
@@ -287,6 +299,7 @@ static void start_hosted_wifi_link(void)
     }
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
