@@ -645,9 +645,7 @@ void app_main(void)
     start_control_channel();
     start_hosted_wifi_link();
     start_ble_hosted();
-    //start_can_bridge(); // disabled: linking esp_driver_spi shifts global ctor
-    // order and exposes a race in esp_hosted's own __attribute__((constructor))
-    // init (port_esp_hosted_host_init.c), which crashes before app_main runs.
+    //start_can_bridge(); // disabled: crashes esp_hosted's own init, see memory
 
     uint32_t count = 0;
     while (1) {
