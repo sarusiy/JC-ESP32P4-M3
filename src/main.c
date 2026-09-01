@@ -102,7 +102,10 @@ static void can_echo_task(void *arg)
     uint8_t data[8];
 
     while (1) {
-        if (mcp2515_receive(&id, &dlc, data)) {
+        /* Drain both hardware RX buffers before sleeping; otherwise a second
+         * frame arriving while the first is still pending gets left behind
+         * and can overflow/reorder under back-to-back multi-frame traffic. */
+        while (mcp2515_receive(&id, &dlc, data)) {
             printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
                    (unsigned long)id, dlc, dlc, data);
             mcp2515_send(id, dlc, data);
