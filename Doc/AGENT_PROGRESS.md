@@ -107,3 +107,42 @@
   - Also confirmed our board's actual C6 co-processor firmware version is 2.3.0 (visible via the newer host library's `Version mismatch: Host [x] > Co-proc [2.3.0]` log line, which doesn't exist in host 2.0.17).
   - Notes for future debugging kept in `/memories/repo/esp-hosted-crash-fix.md`: the board exposes direct UART header pins for the C6 co-processor (`connector pinout list.jpeg`: C6_U0RXD, C6_U0TXD, C6_IO9 boot-strap, C6_CHIP_PU reset) for directly reflashing the C6 slave firmware if ever needed, bypassing SDIO/WiFi entirely; and `esp_hosted_get_coprocessor_fwversion()` is a cheap non-destructive way to query the C6's actual firmware version over the existing transport, no WiFi needed.
   - Next step: none pending on firmware; feature is complete and validated. Future: consider HTTPS/auth on the frequency API before untrusted-network use.
+
+- 2026-09-01 (local): CAN bus bridge implemented and validated end-to-end.
+  - Goal: add CAN bus support via an MCP2515/TJA1050 module on header JP1,
+    with a second MCP2515 module on a companion Arduino Uno
+    (`git@github.com:sarusiy/ArdunioUsbBridgeToCan.git`) acting as a
+    USB-CAN bridge/simulator for testing, per `Doc/electrical drawing.vsdx`.
+  - Phase 1 scope: HW connectivity test only. P4 echoes back any CAN frame
+    it receives; Arduino sends an incrementing ASCII digit every second and
+    checks the echo matches.
+  - Bug 1 (crash): writing `src/mcp2515.c` using ESP-IDF's `driver/spi_master.h`
+    crashed the board before `app_main()` even ran, with `assert failed:
+    xTaskCreateStaticPinnedToCore ... xPortCheckValidTCBMem(pxTaskBuffer)`,
+    triggered inside `esp_hosted`'s own `__attribute__((constructor))` init
+    (`managed_components/espressif__esp_hosted/host/port/esp/freertos/src/
+    port_esp_hosted_host_init.c`). Confirmed via bisection this was purely
+    caused by `esp_driver_spi` being linked into the binary at all (not our
+    code's logic/timing - a build with the SPI code present but unreachable/
+    dead-code-eliminated booted fine). Patched the vendor file to use a
+    properly-sequenced `ESP_SYSTEM_INIT_FN` instead of the raw constructor
+    (a real bug fix, kept), and added a diagnostic print proving 168KB free
+    heap at the crash point (ruling out memory exhaustion). Neither fix
+    alone resolved the crash. **Actual fix**: rewrote `mcp2515.c`/`.h` to
+    bit-bang SPI over plain GPIO instead of `driver/spi_master.h`, so
+    `esp_driver_spi` is never linked in at all. This sidesteps the issue
+    rather than root-causing it, but is fully reliable. Commit `cc5f59a`.
+    Full details in `/memories/repo/esp-hosted-crash-fix.md`.
+  - Bug 2 (wrong GPIOs): `main.c`'s `CAN_SCK/MOSI/MISO/CS_GPIO` `#define`s had
+    the exact opposite mapping from `Doc/electrical drawing.png` (drawing:
+    49=CS, 50=SCK, 51=MOSI, 52=MISO; code had 49=SCK, 50=MOSI, 51=MISO,
+    52=CS). User had wired per the drawing (correct); the firmware defines
+    were the bug. Fixed in commit `f0c8970`.
+  - Confirmed on hardware after both fixes: P4 boots cleanly every time
+    (WiFi connects + gets IP, BLE advertises, CAN bridge initializes), and
+    the full CAN round trip works with zero errors across many frames -
+    Arduino TX always `OK`, P4 always logs `CAN RX ... -> echoing`, Arduino
+    RX always reports "echo matches last TX".
+  - Next step: Phase 2 - replace the Arduino's test payload with an actual
+    USB<->CAN bridge protocol (e.g. SLCAN) so a PC can inject/observe real
+    CAN frames via the Arduino.

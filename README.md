@@ -136,6 +136,23 @@ The endpoint is intended for a trusted local network during development. Add aut
 
 The project uses GPIO 28 as configured in the firmware source. This is the board pin currently used for the test LED.
 
+## CAN bus status
+
+The board has an MCP2515/TJA1050 CAN module wired to header JP1, driven by `src/mcp2515.c`/`src/mcp2515.h`, and is validated end-to-end on hardware against a second MCP2515 module on an Arduino Uno (`git@github.com:sarusiy/ArdunioUsbBridgeToCan.git`).
+
+```text
+| Signal    | GPIO |
+|-----------|------|
+| CS        | 49   |
+| SCK       | 50   |
+| MOSI (SI) | 51   |
+| MISO (SO) | 52   |
+```
+
+Confirmed working: the P4 receives CAN frames sent by the Arduino and echoes them back unchanged, while Wi-Fi and BLE keep running simultaneously with no crashes. See `Doc/electrical drawing.png`/`Doc/ESP32_MCP2515_TJA1050_TRIAL_WIRING.md` for the wiring this targets.
+
+**SPI is bit-banged over plain GPIO, not `driver/spi_master.h`.** Linking `esp_driver_spi` into this project crashes the board before `app_main()` even runs, with `assert failed: xTaskCreateStaticPinnedToCore ... xPortCheckValidTCBMem(pxTaskBuffer)`, triggered inside `esp_hosted`'s own init (confirmed unrelated to free heap - 168KB free at the crash point). Root cause not fully identified upstream; bit-banging avoids the trigger entirely. See `Doc/AGENT_PROGRESS.md` and `/memories/repo/esp-hosted-crash-fix.md` for the full investigation.
+
 ## Live frequency control
 
 Open the board's control USB serial port at 115200 baud. The application prints `ON` and `OFF` while blinking. Enter these commands followed by Enter:
