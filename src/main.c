@@ -31,18 +31,18 @@
 #define LED_GPIO 28
 #endif
 
-/* MCP2515 CAN module wiring on header JP1 (see Doc/electrical drawing.vsdx). */
+/* MCP2515 CAN module wiring on header JP1 (see Doc/electrical drawing.png). */
+#ifndef CAN_CS_GPIO
+#define CAN_CS_GPIO 49
+#endif
 #ifndef CAN_SCK_GPIO
-#define CAN_SCK_GPIO 49
+#define CAN_SCK_GPIO 50
 #endif
 #ifndef CAN_MOSI_GPIO
-#define CAN_MOSI_GPIO 50
+#define CAN_MOSI_GPIO 51
 #endif
 #ifndef CAN_MISO_GPIO
-#define CAN_MISO_GPIO 51
-#endif
-#ifndef CAN_CS_GPIO
-#define CAN_CS_GPIO 52
+#define CAN_MISO_GPIO 52
 #endif
 #define CAN_TEST_ID 0x100
 
