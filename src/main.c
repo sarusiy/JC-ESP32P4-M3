@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_hosted.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 #include "nimble/ble.h"
@@ -24,10 +25,26 @@
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
+#include "mcp2515.h"
 
 #ifndef LED_GPIO
 #define LED_GPIO 28
 #endif
+
+/* MCP2515 CAN module wiring on header JP1 (see Doc/electrical drawing.vsdx). */
+#ifndef CAN_SCK_GPIO
+#define CAN_SCK_GPIO 49
+#endif
+#ifndef CAN_MOSI_GPIO
+#define CAN_MOSI_GPIO 50
+#endif
+#ifndef CAN_MISO_GPIO
+#define CAN_MISO_GPIO 51
+#endif
+#ifndef CAN_CS_GPIO
+#define CAN_CS_GPIO 52
+#endif
+#define CAN_TEST_ID 0x100
 
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
@@ -74,6 +91,43 @@ static void init_led(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
+}
+
+/* Phase 1 HW connectivity test: echo back any CAN frame received, unchanged. */
+static void can_echo_task(void *arg)
+{
+    (void)arg;
+    uint32_t id;
+    uint8_t dlc;
+    uint8_t data[8];
+
+    while (1) {
+        if (mcp2515_receive(&id, &dlc, data)) {
+            printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
+                   (unsigned long)id, dlc, dlc, data);
+            mcp2515_send(id, dlc, data);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void start_can_bridge(void)
+{
+    mcp2515_config_t config = {
+        .spi_host = SPI2_HOST,
+        .sck_gpio = CAN_SCK_GPIO,
+        .mosi_gpio = CAN_MOSI_GPIO,
+        .miso_gpio = CAN_MISO_GPIO,
+        .cs_gpio = CAN_CS_GPIO,
+    };
+
+    if (mcp2515_init(&config) != ESP_OK) {
+        printf("CAN bridge init failed; check MCP2515 wiring/power\n");
+        return;
+    }
+
+    xTaskCreate(can_echo_task, "can_echo", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+    printf("CAN bridge ready: echoing received frames (test id=0x%03x)\n", CAN_TEST_ID);
 }
 
 static void cdc_send(const char *msg)
@@ -584,10 +638,16 @@ void app_main(void)
     init_led();
 
     printf("JC-ESP32P4-M3 booted. Blinking LED on GPIO %d\n", LED_GPIO);
+    printf("Free heap before hosted init: %lu bytes (internal: %lu)\n",
+           (unsigned long)esp_get_free_heap_size(),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     start_control_channel();
     start_hosted_wifi_link();
     start_ble_hosted();
+    //start_can_bridge(); // disabled: linking esp_driver_spi shifts global ctor
+    // order and exposes a race in esp_hosted's own __attribute__((constructor))
+    // init (port_esp_hosted_host_init.c), which crashes before app_main runs.
 
     uint32_t count = 0;
     while (1) {
