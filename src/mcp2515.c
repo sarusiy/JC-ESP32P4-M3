@@ -1,7 +1,8 @@
 #include "mcp2515.h"
 
 #include <string.h>
-#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "rom/ets_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,7 +13,6 @@ static const char *TAG = "mcp2515";
 #define MCP_RESET       0xC0
 #define MCP_READ        0x03
 #define MCP_WRITE       0x02
-#define MCP_BITMOD      0x05
 #define MCP_READ_STATUS 0xA0
 #define MCP_RTS_TXB0    0x81
 #define MCP_READ_RXB0   0x90
@@ -24,9 +24,7 @@ static const char *TAG = "mcp2515";
 #define REG_CNF2      0x29
 #define REG_CNF3      0x28
 #define REG_CANINTE   0x2B
-#define REG_CANINTF   0x2C
 #define REG_RXB0CTRL  0x60
-#define REG_RXB0SIDH  0x61
 #define REG_RXB1CTRL  0x70
 #define REG_TXB0SIDH  0x31
 
@@ -38,15 +36,44 @@ static const char *TAG = "mcp2515";
 #define CNF2_500KBPS_8MHZ 0x90
 #define CNF3_500KBPS_8MHZ 0x02
 
-static spi_device_handle_t s_spi;
+/* Conservative bit-bang half-period; well under the 1 MHz cap the trial
+ * wiring doc (direct 3.3V GPIO to a 5V-powered module) recommends. */
+#define BITBANG_HALF_PERIOD_US 2
+
+static int s_sck_gpio;
+static int s_mosi_gpio;
+static int s_miso_gpio;
+static int s_cs_gpio;
+
+/* SPI mode 0 (CPOL=0, CPHA=0), MSB first: set MOSI while SCK is low, sample
+ * MISO on the rising edge. Avoids linking esp_driver_spi entirely (see
+ * mcp2515.h for why). */
+static uint8_t spi_transfer_byte(uint8_t out)
+{
+    uint8_t in = 0;
+    for (int bit = 7; bit >= 0; bit--) {
+        gpio_set_level(s_mosi_gpio, (out >> bit) & 1);
+        ets_delay_us(BITBANG_HALF_PERIOD_US);
+        gpio_set_level(s_sck_gpio, 1);
+        ets_delay_us(BITBANG_HALF_PERIOD_US);
+        in = (uint8_t)((in << 1) | gpio_get_level(s_miso_gpio));
+        gpio_set_level(s_sck_gpio, 0);
+    }
+    return in;
+}
 
 static void mcp2515_cmd(const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    spi_transaction_t t = {0};
-    t.length = len * 8;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
-    spi_device_transmit(s_spi, &t);
+    gpio_set_level(s_cs_gpio, 0);
+    ets_delay_us(BITBANG_HALF_PERIOD_US);
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = spi_transfer_byte(tx[i]);
+        if (rx) {
+            rx[i] = b;
+        }
+    }
+    ets_delay_us(BITBANG_HALF_PERIOD_US);
+    gpio_set_level(s_cs_gpio, 1);
 }
 
 static uint8_t mcp2515_read_reg(uint8_t addr)
@@ -85,31 +112,31 @@ static bool mcp2515_set_mode(uint8_t mode)
 
 esp_err_t mcp2515_init(const mcp2515_config_t *config)
 {
-    spi_bus_config_t buscfg = {
-        .sclk_io_num = config->sck_gpio,
-        .mosi_io_num = config->mosi_gpio,
-        .miso_io_num = config->miso_gpio,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 32,
-    };
-    esp_err_t err = spi_bus_initialize(config->spi_host, &buscfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    s_sck_gpio = config->sck_gpio;
+    s_mosi_gpio = config->mosi_gpio;
+    s_miso_gpio = config->miso_gpio;
+    s_cs_gpio = config->cs_gpio;
 
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 1 * 1000 * 1000,
-        .mode = 0,
-        .spics_io_num = config->cs_gpio,
-        .queue_size = 1,
+    gpio_config_t out_conf = {
+        .pin_bit_mask = (1ULL << s_sck_gpio) | (1ULL << s_mosi_gpio) | (1ULL << s_cs_gpio),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
-    err = spi_bus_add_device(config->spi_host, &devcfg, &s_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    gpio_config(&out_conf);
+
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << s_miso_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&in_conf);
+
+    gpio_set_level(s_sck_gpio, 0);
+    gpio_set_level(s_cs_gpio, 1);
 
     uint8_t reset_cmd = MCP_RESET;
     mcp2515_cmd(&reset_cmd, NULL, 1);
@@ -134,7 +161,7 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config)
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "MCP2515 ready: 500 kbps (8 MHz osc), normal mode.");
+    ESP_LOGI(TAG, "MCP2515 ready: 500 kbps (8 MHz osc), normal mode, bit-banged SPI.");
     return ESP_OK;
 }
 

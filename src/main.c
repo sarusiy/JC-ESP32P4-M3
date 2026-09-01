@@ -114,7 +114,6 @@ static void can_echo_task(void *arg)
 static void start_can_bridge(void)
 {
     mcp2515_config_t config = {
-        .spi_host = SPI2_HOST,
         .sck_gpio = CAN_SCK_GPIO,
         .mosi_gpio = CAN_MOSI_GPIO,
         .miso_gpio = CAN_MISO_GPIO,
@@ -645,7 +644,7 @@ void app_main(void)
     start_control_channel();
     start_hosted_wifi_link();
     start_ble_hosted();
-    //start_can_bridge(); // disabled: crashes esp_hosted's own init, see memory
+    start_can_bridge();
 
     uint32_t count = 0;
     while (1) {
