@@ -72,3 +72,9 @@ Body: freq <ms>
 
 1. Validate several valid and invalid `freq` writes and `0xFFF2` notifications from Android.
 2. Add BLE-based Wi-Fi provisioning after LED control is stable.
+3. Add a deferred vehicle CAN analysis mode:
+  - Start with listen-only CAN capture so the project cannot transmit onto the vehicle bus.
+  - Stream timestamp, bus, CAN ID, frame format, DLC, and payload to a PC over USB or Wi-Fi.
+  - Implement GVRET compatibility for live analysis in SavvyCAN.
+  - Add log export or conversion for Cabana-compatible offline analysis if needed.
+  - Support loading matching DBC definitions, including compatible definitions from `opendbc`.
