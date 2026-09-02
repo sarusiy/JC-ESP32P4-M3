@@ -53,7 +53,7 @@
 #define OBD_REQUEST_ID 0x7DF
 #define OBD_RESPONSE_ID 0x7E8
 #define OBD_MODE_CURRENT_DATA 0x01
-#define OBD_QUERY_INTERVAL_MS 1000
+#define OBD_QUERY_INTERVAL_MS 200
 #define OBD_RESPONSE_TIMEOUT_MS 500
 
 #define BLINK_HALF_PERIOD_MIN_MS 10
@@ -67,6 +67,16 @@ static httpd_handle_t http_server;
 static const char *TAG = "main";
 /* Runtime log verbosity, changed live via the "ll" control-channel command. */
 static esp_log_level_t s_log_level = ESP_LOG_INFO;
+
+typedef struct {
+    uint32_t supported_pids;
+    int coolant_c;
+    uint16_t rpm;
+    uint8_t speed_kmh;
+    uint8_t throttle_pct;
+} obd_state_t;
+
+static obd_state_t s_obd_state;
 
 typedef struct {
     uint8_t dlc;
@@ -193,28 +203,34 @@ static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
     switch (pid) {
         case 0x00:
             if (len >= 6) {
+                s_obd_state.supported_pids = ((uint32_t)buf[3] << 16) |
+                                              ((uint32_t)buf[4] << 8) | buf[5];
                 ESP_LOGI(TAG, "OBD PID 0x00 (supported PIDs)   -> bitmask %02x %02x %02x",
                          buf[3], buf[4], buf[5]);
             }
             break;
         case 0x05:
             if (len >= 4) {
+                s_obd_state.coolant_c = buf[3] - 40;
                 ESP_LOGI(TAG, "OBD PID 0x05 (coolant temp)      -> %d C", buf[3] - 40);
             }
             break;
         case 0x0C:
             if (len >= 5) {
+                s_obd_state.rpm = ((unsigned)buf[3] * 256 + buf[4]) / 4;
                 ESP_LOGI(TAG, "OBD PID 0x0C (engine RPM)        -> %u rpm",
                          ((unsigned)buf[3] * 256 + buf[4]) / 4);
             }
             break;
         case 0x0D:
             if (len >= 4) {
+                s_obd_state.speed_kmh = buf[3];
                 ESP_LOGI(TAG, "OBD PID 0x0D (vehicle speed)     -> %u km/h", buf[3]);
             }
             break;
         case 0x11:
             if (len >= 4) {
+                s_obd_state.throttle_pct = (buf[3] * 100u) / 255u;
                 ESP_LOGI(TAG, "OBD PID 0x11 (throttle position) -> %u %%", (buf[3] * 100u) / 255u);
             }
             break;
@@ -396,6 +412,19 @@ static esp_err_t frequency_http_handler(httpd_req_t *request)
     return accepted ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t obd_http_handler(httpd_req_t *request)
+{
+    obd_state_t state = s_obd_state;
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"supported_pids\":\"%06lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
+             (unsigned long)(state.supported_pids & 0xFFFFFF), state.coolant_c,
+             state.rpm, state.speed_kmh, state.throttle_pct);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static void start_frequency_http_server(void)
 {
     if (http_server != NULL) {
@@ -408,10 +437,17 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = frequency_http_handler,
     };
+    httpd_uri_t obd_uri = {
+        .uri = "/api/obd",
+        .method = HTTP_GET,
+        .handler = obd_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
+        httpd_register_uri_handler(http_server, &obd_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
+        ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
     }
 }
 
