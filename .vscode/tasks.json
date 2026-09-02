@@ -104,6 +104,24 @@
         "c:\\projects\\JC-ESP32P4-M3"
       ],
       "isBackground": true
+    },
+    {
+      "label": "menu",
+      "type": "shell",
+      "command": "py",
+      "args": [
+        "-3.11",
+        "-m",
+        "serial.tools.miniterm",
+        "COM5",
+        "115200",
+        "--echo"
+      ],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
     }
   ]
 }

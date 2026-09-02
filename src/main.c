@@ -4,9 +4,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -46,6 +48,14 @@
 #endif
 #define CAN_TEST_ID 0x100
 
+/* OBD-II (SAE J1979) scan-tool request/response IDs, matching the simulated
+ * ECU in the ArdunioUsbBridgeToCan repo. */
+#define OBD_REQUEST_ID 0x7DF
+#define OBD_RESPONSE_ID 0x7E8
+#define OBD_MODE_CURRENT_DATA 0x01
+#define OBD_QUERY_INTERVAL_MS 1000
+#define OBD_RESPONSE_TIMEOUT_MS 500
+
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
 
@@ -53,6 +63,18 @@
 static volatile uint32_t blink_half_period_ms = 500;
 static bool wifi_started;
 static httpd_handle_t http_server;
+
+static const char *TAG = "main";
+/* Runtime log verbosity, changed live via the "ll" control-channel command. */
+static esp_log_level_t s_log_level = ESP_LOG_INFO;
+
+typedef struct {
+    uint8_t dlc;
+    uint8_t data[8];
+} obd_frame_t;
+
+/* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
+static QueueHandle_t s_obd_response_queue;
 
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 static void ble_publish_response(uint16_t conn_handle, const char *message);
@@ -81,6 +103,47 @@ static bool apply_freq_command(const char *line, char *out_msg, size_t out_msg_l
     return true;
 }
 
+static const char *log_level_to_string(esp_log_level_t level)
+{
+    switch (level) {
+        case ESP_LOG_ERROR: return "ERROR";
+        case ESP_LOG_WARN:  return "WARNING";
+        case ESP_LOG_INFO:  return "INFO";
+        case ESP_LOG_DEBUG: return "DEBUG";
+        default:            return "UNKNOWN";
+    }
+}
+
+/* Levels are numbered 0-3 for the "ll" command: 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR. */
+static bool log_level_from_number(const char *text, esp_log_level_t *out_level)
+{
+    static const esp_log_level_t levels[] = { ESP_LOG_DEBUG, ESP_LOG_INFO, ESP_LOG_WARN, ESP_LOG_ERROR };
+
+    char *endptr = NULL;
+    long value = strtol(text, &endptr, 10);
+    if (endptr == text || *endptr != '\0' || value < 0 || value >= (long)(sizeof(levels) / sizeof(levels[0]))) {
+        return false;
+    }
+
+    *out_level = levels[value];
+    return true;
+}
+
+/* Shared command parser: "ll <0-3>" (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR), controls our own TAG's verbosity. */
+static bool apply_ll_command(const char *line, char *out_msg, size_t out_msg_len)
+{
+    esp_log_level_t level;
+    if (strncmp(line, "ll ", 3) != 0 || !log_level_from_number(line + 3, &level)) {
+        snprintf(out_msg, out_msg_len, "ERR usage: ll <0-3> (0=DEBUG 1=INFO 2=WARNING 3=ERROR)\r\n");
+        return false;
+    }
+
+    s_log_level = level;
+    esp_log_level_set(TAG, level);
+    snprintf(out_msg, out_msg_len, "OK ll=%s\r\n", log_level_to_string(level));
+    return true;
+}
+
 static void init_led(void)
 {
     gpio_config_t io_conf = {
@@ -93,7 +156,9 @@ static void init_led(void)
     gpio_config(&io_conf);
 }
 
-/* Phase 1 HW connectivity test: echo back any CAN frame received, unchanged. */
+/* Phase 1 echo test frames get echoed back; OBD-II responses get routed to
+ * obd_query_task via a queue instead of being echoed. Single task owns the
+ * MCP2515 RX poll so the two consumers never race for the same frame. */
 static void can_echo_task(void *arg)
 {
     (void)arg;
@@ -106,11 +171,85 @@ static void can_echo_task(void *arg)
          * frame arriving while the first is still pending gets left behind
          * and can overflow/reorder under back-to-back multi-frame traffic. */
         while (mcp2515_receive(&id, &dlc, data)) {
+            if (id == OBD_RESPONSE_ID) {
+                obd_frame_t frame = { .dlc = dlc };
+                memcpy(frame.data, data, sizeof(frame.data));
+                xQueueSend(s_obd_response_queue, &frame, 0);
+                continue;
+            }
             printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
                    (unsigned long)id, dlc, dlc, data);
             mcp2515_send(id, dlc, data);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* Decodes and prints one PID's response payload (buf[0]=len, buf[1]=mode+0x40,
+ * buf[2]=pid, buf[3..]=data), per the SAE J1979 formulas for each PID. */
+static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
+{
+    /* buf[0]=len, buf[1]=mode+0x40, buf[2]=pid echo, buf[3..]=actual parameter bytes. */
+    switch (pid) {
+        case 0x00:
+            if (len >= 6) {
+                ESP_LOGI(TAG, "OBD PID 0x00 (supported PIDs)   -> bitmask %02x %02x %02x",
+                         buf[3], buf[4], buf[5]);
+            }
+            break;
+        case 0x05:
+            if (len >= 4) {
+                ESP_LOGI(TAG, "OBD PID 0x05 (coolant temp)      -> %d C", buf[3] - 40);
+            }
+            break;
+        case 0x0C:
+            if (len >= 5) {
+                ESP_LOGI(TAG, "OBD PID 0x0C (engine RPM)        -> %u rpm",
+                         ((unsigned)buf[3] * 256 + buf[4]) / 4);
+            }
+            break;
+        case 0x0D:
+            if (len >= 4) {
+                ESP_LOGI(TAG, "OBD PID 0x0D (vehicle speed)     -> %u km/h", buf[3]);
+            }
+            break;
+        case 0x11:
+            if (len >= 4) {
+                ESP_LOGI(TAG, "OBD PID 0x11 (throttle position) -> %u %%", (buf[3] * 100u) / 255u);
+            }
+            break;
+        default:
+            ESP_LOGI(TAG, "OBD PID 0x%02x -> unrecognized response", pid);
+            break;
+    }
+}
+
+/* Acts as a minimal scan tool: requests each supported PID in turn on the
+ * broadcast functional ID, waits for the ECU's 0x7E8 reply, and prints it. */
+static void obd_query_task(void *arg)
+{
+    (void)arg;
+    static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11 };
+
+    while (1) {
+        for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
+            uint8_t request[8] = { 0x02, OBD_MODE_CURRENT_DATA, pids[i], 0, 0, 0, 0, 0 };
+            mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+
+            obd_frame_t response;
+            bool got = xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+            if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
+                obd_print_response(pids[i], response.data, response.dlc);
+            } else if (got) {
+                /* A stale/misordered response for a different PID; discard rather than misdecode it. */
+                ESP_LOGW(TAG, "OBD PID 0x%02x -> mismatched response (got pid 0x%02x), discarding",
+                         pids[i], response.data[2]);
+            } else {
+                ESP_LOGI(TAG, "OBD PID 0x%02x -> no response (timeout)", pids[i]);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+        }
     }
 }
 
@@ -124,12 +263,16 @@ static void start_can_bridge(void)
     };
 
     if (mcp2515_init(&config) != ESP_OK) {
-        printf("CAN bridge init failed; check MCP2515 wiring/power\n");
+        ESP_LOGE(TAG, "CAN bridge init failed; check MCP2515 wiring/power");
         return;
     }
 
+    s_obd_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
+
     xTaskCreate(can_echo_task, "can_echo", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-    printf("CAN bridge ready: echoing received frames (test id=0x%03x)\n", CAN_TEST_ID);
+    xTaskCreate(obd_query_task, "obd_query", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+    ESP_LOGI(TAG, "CAN bridge ready: echoing received frames (test id=0x%03x), OBD-II scan tool querying PIDs",
+             CAN_TEST_ID);
 }
 
 static void cdc_send(const char *msg)
@@ -140,17 +283,19 @@ static void cdc_send(const char *msg)
 
 static void send_menu(void)
 {
-    char menu[220];
+    char menu[320];
     snprintf(menu, sizeof(menu),
              "\r\n=== JC-ESP32P4-M3 control channel ===\r\n"
              "freq <ms>  set blink half-period, %d-%d ms (current: %lu). Example: freq 250\r\n"
+             "ll <0-3>   set log verbosity: 0=DEBUG 1=INFO 2=WARNING 3=ERROR (current: %s)\r\n"
              "help       show this menu\r\n",
              BLINK_HALF_PERIOD_MIN_MS, BLINK_HALF_PERIOD_MAX_MS,
-             (unsigned long)blink_half_period_ms);
+             (unsigned long)blink_half_period_ms,
+             log_level_to_string(s_log_level));
     cdc_send(menu);
 }
 
-/* Parses "freq <ms>" / "help" typed into the control channel. */
+/* Parses "freq <ms>" / "ll <0-3>" / "help" typed into the control channel. */
 static void handle_command(char *line)
 {
     char msg[96];
@@ -158,7 +303,9 @@ static void handle_command(char *line)
     if (strcmp(line, "help") == 0) {
         send_menu();
     } else if (strlen(line) > 0) {
-        bool ok = apply_freq_command(line, msg, sizeof(msg));
+        bool ok = (strncmp(line, "ll ", 3) == 0)
+                      ? apply_ll_command(line, msg, sizeof(msg))
+                      : apply_freq_command(line, msg, sizeof(msg));
         printf("USB cmd '%s' -> %s", line, ok ? "OK\n" : "ERR\n");
         cdc_send(msg);
     }
@@ -264,7 +411,7 @@ static void start_frequency_http_server(void)
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
-        printf("WiFi frequency API ready: POST /api/frequency\n");
+        ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
     }
 }
 
@@ -276,7 +423,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = event_data;
         char address[16];
         esp_ip4addr_ntoa(&event->ip_info.ip, address, sizeof(address));
-        printf("WiFi connected, IP: %s\n", address);
+        ESP_LOGI(TAG, "WiFi connected, IP: %s", address);
         start_frequency_http_server();
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
         char response[64];
@@ -350,31 +497,31 @@ static void start_hosted_wifi_link(void)
 {
     esp_err_t err = esp_hosted_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        printf("ESP-Hosted init failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ESP-Hosted init failed: %s", esp_err_to_name(err));
         return;
     }
 
     err = esp_hosted_connect_to_slave();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        printf("ESP-Hosted slave connect failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "ESP-Hosted slave connect failed: %s", esp_err_to_name(err));
         return;
     }
 
     err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        printf("WiFi netif init failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi netif init failed: %s", esp_err_to_name(err));
         return;
     }
 
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        printf("WiFi event loop init failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi event loop init failed: %s", esp_err_to_name(err));
         return;
     }
 
     /* Without this, the STA associates but never gets a netif/DHCP client, so it never gets an IP. */
     if (esp_netif_create_default_wifi_sta() == NULL) {
-        printf("WiFi STA netif create failed\n");
+        ESP_LOGE(TAG, "WiFi STA netif create failed");
         return;
     }
 
@@ -384,7 +531,7 @@ static void start_hosted_wifi_link(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
-        printf("WiFi init failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -399,23 +546,23 @@ static void start_hosted_wifi_link(void)
 
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
-        printf("WiFi set mode failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi set mode failed: %s", esp_err_to_name(err));
         return;
     }
 
     err = esp_wifi_start();
     if (err != ESP_OK) {
-        printf("WiFi start failed: %s\n", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
         return;
     }
 
     wifi_started = true;
-    printf("Hosted radio link is up (P4 host, C6 co-processor).\n");
+    ESP_LOGI(TAG, "Hosted radio link is up (P4 host, C6 co-processor).");
 }
 #else
 static void start_hosted_wifi_link(void)
 {
-    printf("ESP-Hosted disabled in this build; hosted radio link not started.\n");
+    ESP_LOGI(TAG, "ESP-Hosted disabled in this build; hosted radio link not started.");
 }
 #endif
 
@@ -562,7 +709,7 @@ static void ble_start_advertising(void)
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
-        printf("BLE adv fields failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "BLE adv fields failed: rc=%d", rc);
         return;
     }
 
@@ -571,18 +718,18 @@ static void ble_start_advertising(void)
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, ble_gap_event, NULL);
     if (rc != 0) {
-        printf("BLE adv start failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "BLE adv start failed: rc=%d", rc);
         return;
     }
 
-    printf("BLE advertising started as %s\n", name);
+    ESP_LOGI(TAG, "BLE advertising started as %s", name);
 }
 
 static void ble_on_sync(void)
 {
     int rc = ble_hs_id_infer_auto(0, &s_ble_addr_type);
     if (rc != 0) {
-        printf("BLE addr infer failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "BLE addr infer failed: rc=%d", rc);
         return;
     }
     ble_start_advertising();
@@ -599,7 +746,7 @@ static void start_ble_hosted(void)
 {
     int rc = nimble_port_init();
     if (rc != 0) {
-        printf("NimBLE init failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "NimBLE init failed: rc=%d", rc);
         return;
     }
 
@@ -608,23 +755,23 @@ static void start_ble_hosted(void)
 
     rc = ble_gatts_count_cfg(gatt_svcs);
     if (rc != 0) {
-        printf("BLE count cfg failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "BLE count cfg failed: rc=%d", rc);
         return;
     }
     rc = ble_gatts_add_svcs(gatt_svcs);
     if (rc != 0) {
-        printf("BLE add service failed: rc=%d\n", rc);
+        ESP_LOGE(TAG, "BLE add service failed: rc=%d", rc);
         return;
     }
 
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
-    printf("NimBLE host started (controller on C6 over hosted link).\n");
+    ESP_LOGI(TAG, "NimBLE host started (controller on C6 over hosted link).");
 }
 #else
 static void start_ble_hosted(void)
 {
-    printf("BLE disabled in this build; hosted BLE not started.\n");
+    ESP_LOGI(TAG, "BLE disabled in this build; hosted BLE not started.");
 }
 #endif
 
@@ -638,11 +785,12 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_err);
 
     init_led();
+    esp_log_level_set(TAG, s_log_level);
 
-    printf("JC-ESP32P4-M3 booted. Blinking LED on GPIO %d\n", LED_GPIO);
-    printf("Free heap before hosted init: %lu bytes (internal: %lu)\n",
-           (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "JC-ESP32P4-M3 booted. Blinking LED on GPIO %d", LED_GPIO);
+    ESP_LOGI(TAG, "Free heap before hosted init: %lu bytes (internal: %lu)",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     start_control_channel();
     start_hosted_wifi_link();
@@ -654,11 +802,11 @@ void app_main(void)
         uint32_t half_period = blink_half_period_ms;
 
         gpio_set_level(LED_GPIO, 1);
-        printf("ON\n");
+        ESP_LOGD(TAG, "ON");
         vTaskDelay(pdMS_TO_TICKS(half_period));
 
         gpio_set_level(LED_GPIO, 0);
-        printf("OFF\n");
+        ESP_LOGD(TAG, "OFF");
         vTaskDelay(pdMS_TO_TICKS(half_period));
 
         count++;
