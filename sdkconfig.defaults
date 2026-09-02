@@ -1,7 +1,23 @@
 # The board is fitted with a 16 MB flash device.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# This board's actual silicon is chip revision v1.3, not the >=v3.0 silicon
+# ESP-IDF defaults to targeting. REV_MIN_100 alone is not enough: it's gated
+# behind SELECTS_REV_LESS_V3, so both must be set together or Kconfig falls
+# back to requiring rev >=v3.1 and the board refuses to flash/boot.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
+
+# 400 MHz is not guaranteed on pre-rev3 chips and crashes this board
+# (assert failed: esp_clk_init) at boot; 360 MHz is the safe alternative.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# Allow DEBUG-level logs to be compiled in (still hidden by default at
+# runtime) so the "ll 0" control-channel command can enable them live.
+# CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT is not set
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_COLORS=y
 
 # Make the USB-Serial/JTAG port (used for flashing/monitoring, e.g. COM3) the
 # primary console so it receives stdin too; the default UART0 console is
