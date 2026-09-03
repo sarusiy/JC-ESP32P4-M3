@@ -122,9 +122,15 @@ static void capture_can_frame(uint32_t id, uint8_t dlc, const uint8_t *data)
     portEXIT_CRITICAL(&s_can_capture_lock);
 }
 
+/* Counters used to verify GPIO29 wiring: isr_count only increments on a real
+ * falling edge; timeout_count increments when the 100ms fallback fires instead. */
+static volatile uint32_t s_can_isr_count;
+static volatile uint32_t s_can_timeout_count;
+
 static void IRAM_ATTR can_int_isr(void *arg)
 {
     (void)arg;
+    s_can_isr_count++;
     BaseType_t higher_priority_task_woken = pdFALSE;
     if (s_can_rx_task != NULL) {
         vTaskNotifyGiveFromISR(s_can_rx_task, &higher_priority_task_woken);
@@ -225,7 +231,9 @@ static void can_echo_task(void *arg)
     uint8_t data[8];
 
     while (1) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0) {
+            s_can_timeout_count++;
+        }
         /* Drain both hardware RX buffers before sleeping; otherwise a second
          * frame arriving while the first is still pending gets left behind
          * and can overflow/reorder under back-to-back multi-frame traffic. */
@@ -353,7 +361,7 @@ static void start_can_bridge(void)
     gpio_config_t int_conf = {
         .pin_bit_mask = (1ULL << CAN_INT_GPIO),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_NEGEDGE,
     };
@@ -547,10 +555,11 @@ static esp_err_t can_capture_http_handler(httpd_req_t *request)
 
     size_t used = (size_t)snprintf(response, CAN_CAPTURE_RESPONSE_SIZE,
                                    "{\"latest\":%llu,\"dropped\":%llu,\"hardware_overflow\":%lu,"
-                                   "\"passive\":%s,\"frames\":[",
+                                   "\"passive\":%s,\"isr_count\":%lu,\"timeout_count\":%lu,\"frames\":[",
                                    (unsigned long long)latest, (unsigned long long)dropped,
                                    (unsigned long)mcp2515_get_receive_overflow_count(),
-                                   s_can_passive ? "true" : "false");
+                                   s_can_passive ? "true" : "false",
+                                   (unsigned long)s_can_isr_count, (unsigned long)s_can_timeout_count);
     for (size_t i = 0; i < count; i++) {
         can_capture_frame_t *frame = &batch[i];
         used += (size_t)snprintf(response + used, CAN_CAPTURE_RESPONSE_SIZE - used,
