@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 
@@ -13,6 +14,7 @@ static const char *TAG = "mcp2515";
 #define MCP_RESET       0xC0
 #define MCP_READ        0x03
 #define MCP_WRITE       0x02
+#define MCP_BIT_MODIFY  0x05
 #define MCP_READ_STATUS 0xA0
 #define MCP_RTS_TXB0    0x81
 #define MCP_READ_RXB0   0x90
@@ -24,12 +26,17 @@ static const char *TAG = "mcp2515";
 #define REG_CNF2      0x29
 #define REG_CNF3      0x28
 #define REG_CANINTE   0x2B
+#define REG_EFLG      0x2D
 #define REG_RXB0CTRL  0x60
 #define REG_RXB1CTRL  0x70
 #define REG_TXB0SIDH  0x31
 
-#define MODE_CONFIG   0x80
-#define MODE_NORMAL   0x00
+#define EFLG_RX0OVR   0x40
+#define EFLG_RX1OVR   0x80
+
+#define MODE_CONFIG      0x80
+#define MODE_LISTEN_ONLY 0x60
+#define MODE_NORMAL      0x00
 
 /* 500 kbps @ 8 MHz crystal (standard MCP2515 timing table). */
 #define CNF1_500KBPS_8MHZ 0x00
@@ -44,6 +51,9 @@ static int s_sck_gpio;
 static int s_mosi_gpio;
 static int s_miso_gpio;
 static int s_cs_gpio;
+static SemaphoreHandle_t s_spi_mutex;
+static uint32_t s_receive_overflow_count;
+static portMUX_TYPE s_overflow_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* SPI mode 0 (CPOL=0, CPHA=0), MSB first: set MOSI while SCK is low, sample
  * MISO on the rising edge. Avoids linking esp_driver_spi entirely (see
@@ -64,6 +74,7 @@ static uint8_t spi_transfer_byte(uint8_t out)
 
 static void mcp2515_cmd(const uint8_t *tx, uint8_t *rx, size_t len)
 {
+    xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
     gpio_set_level(s_cs_gpio, 0);
     ets_delay_us(BITBANG_HALF_PERIOD_US);
     for (size_t i = 0; i < len; i++) {
@@ -74,6 +85,7 @@ static void mcp2515_cmd(const uint8_t *tx, uint8_t *rx, size_t len)
     }
     ets_delay_us(BITBANG_HALF_PERIOD_US);
     gpio_set_level(s_cs_gpio, 1);
+    xSemaphoreGive(s_spi_mutex);
 }
 
 static uint8_t mcp2515_read_reg(uint8_t addr)
@@ -87,6 +99,12 @@ static uint8_t mcp2515_read_reg(uint8_t addr)
 static void mcp2515_write_reg(uint8_t addr, uint8_t value)
 {
     uint8_t tx[3] = { MCP_WRITE, addr, value };
+    mcp2515_cmd(tx, NULL, sizeof(tx));
+}
+
+static void mcp2515_bit_modify(uint8_t addr, uint8_t mask, uint8_t value)
+{
+    uint8_t tx[4] = { MCP_BIT_MODIFY, addr, mask, value };
     mcp2515_cmd(tx, NULL, sizeof(tx));
 }
 
@@ -112,10 +130,20 @@ static bool mcp2515_set_mode(uint8_t mode)
 
 esp_err_t mcp2515_init(const mcp2515_config_t *config)
 {
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_spi_mutex = xSemaphoreCreateMutex();
+    if (s_spi_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_sck_gpio = config->sck_gpio;
     s_mosi_gpio = config->mosi_gpio;
     s_miso_gpio = config->miso_gpio;
     s_cs_gpio = config->cs_gpio;
+    s_receive_overflow_count = 0;
 
     gpio_config_t out_conf = {
         .pin_bit_mask = (1ULL << s_sck_gpio) | (1ULL << s_mosi_gpio) | (1ULL << s_cs_gpio),
@@ -167,6 +195,15 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config)
 
 bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
 {
+    uint8_t overflow_flags = mcp2515_read_reg(REG_EFLG) & (EFLG_RX0OVR | EFLG_RX1OVR);
+    if (overflow_flags != 0) {
+        portENTER_CRITICAL(&s_overflow_lock);
+        s_receive_overflow_count += (overflow_flags & EFLG_RX0OVR ? 1 : 0) +
+                                    (overflow_flags & EFLG_RX1OVR ? 1 : 0);
+        portEXIT_CRITICAL(&s_overflow_lock);
+        mcp2515_bit_modify(REG_EFLG, overflow_flags, 0);
+    }
+
     uint8_t status = mcp2515_read_status();
     bool rxb0_pending = status & 0x01;
     bool rxb1_pending = status & 0x02;
@@ -192,6 +229,21 @@ bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
     *dlc = dlc_byte;
     memcpy(data, &rx[6], dlc_byte);
     return true;
+}
+
+uint32_t mcp2515_get_receive_overflow_count(void)
+{
+    portENTER_CRITICAL(&s_overflow_lock);
+    uint32_t count = s_receive_overflow_count;
+    portEXIT_CRITICAL(&s_overflow_lock);
+    return count;
+}
+
+esp_err_t mcp2515_set_listen_only(bool enabled)
+{
+    return mcp2515_set_mode(enabled ? MODE_LISTEN_ONLY : MODE_NORMAL)
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t mcp2515_send(uint32_t id, uint8_t dlc, const uint8_t *data)

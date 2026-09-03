@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_http_server.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -45,6 +46,9 @@
 #endif
 #ifndef CAN_MISO_GPIO
 #define CAN_MISO_GPIO 52
+#endif
+#ifndef CAN_INT_GPIO
+#define CAN_INT_GPIO 29
 #endif
 #define CAN_TEST_ID 0x100
 
@@ -83,8 +87,52 @@ typedef struct {
     uint8_t data[8];
 } obd_frame_t;
 
+typedef struct {
+    uint64_t sequence;
+    int64_t timestamp_us;
+    uint32_t id;
+    uint8_t dlc;
+    uint8_t data[8];
+} can_capture_frame_t;
+
+#define CAN_CAPTURE_CAPACITY 256
+#define CAN_CAPTURE_HTTP_BATCH 32
+#define CAN_CAPTURE_RESPONSE_SIZE 8192
+
+static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
+static uint64_t s_can_capture_sequence;
+static portMUX_TYPE s_can_capture_lock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_can_rx_task;
+static volatile bool s_can_passive;
+
 /* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
 static QueueHandle_t s_obd_response_queue;
+
+static void capture_can_frame(uint32_t id, uint8_t dlc, const uint8_t *data)
+{
+    int64_t timestamp_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_can_capture_lock);
+    uint64_t sequence = ++s_can_capture_sequence;
+    can_capture_frame_t *frame = &s_can_capture[(sequence - 1) % CAN_CAPTURE_CAPACITY];
+    frame->sequence = sequence;
+    frame->timestamp_us = timestamp_us;
+    frame->id = id;
+    frame->dlc = dlc;
+    memcpy(frame->data, data, dlc);
+    portEXIT_CRITICAL(&s_can_capture_lock);
+}
+
+static void IRAM_ATTR can_int_isr(void *arg)
+{
+    (void)arg;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (s_can_rx_task != NULL) {
+        vTaskNotifyGiveFromISR(s_can_rx_task, &higher_priority_task_woken);
+    }
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 static void ble_publish_response(uint16_t conn_handle, const char *message);
@@ -177,21 +225,28 @@ static void can_echo_task(void *arg)
     uint8_t data[8];
 
     while (1) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
         /* Drain both hardware RX buffers before sleeping; otherwise a second
          * frame arriving while the first is still pending gets left behind
          * and can overflow/reorder under back-to-back multi-frame traffic. */
         while (mcp2515_receive(&id, &dlc, data)) {
+            capture_can_frame(id, dlc, data);
             if (id == OBD_RESPONSE_ID) {
-                obd_frame_t frame = { .dlc = dlc };
-                memcpy(frame.data, data, sizeof(frame.data));
-                xQueueSend(s_obd_response_queue, &frame, 0);
+                if (!s_can_passive) {
+                    obd_frame_t frame = { .dlc = dlc };
+                    memcpy(frame.data, data, sizeof(frame.data));
+                    if (xQueueSend(s_obd_response_queue, &frame, 0) != pdPASS) {
+                        ESP_LOGW(TAG, "OBD response queue full; dropping response");
+                    }
+                }
                 continue;
             }
-            printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
-                   (unsigned long)id, dlc, dlc, data);
-            mcp2515_send(id, dlc, data);
+            if (!s_can_passive && id == CAN_TEST_ID) {
+                printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
+                       (unsigned long)id, dlc, dlc, data);
+                mcp2515_send(id, dlc, data);
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -202,11 +257,12 @@ static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
     /* buf[0]=len, buf[1]=mode+0x40, buf[2]=pid echo, buf[3..]=actual parameter bytes. */
     switch (pid) {
         case 0x00:
-            if (len >= 6) {
-                s_obd_state.supported_pids = ((uint32_t)buf[3] << 16) |
-                                              ((uint32_t)buf[4] << 8) | buf[5];
-                ESP_LOGI(TAG, "OBD PID 0x00 (supported PIDs)   -> bitmask %02x %02x %02x",
-                         buf[3], buf[4], buf[5]);
+            if (len >= 7) {
+                s_obd_state.supported_pids = ((uint32_t)buf[3] << 24) |
+                                              ((uint32_t)buf[4] << 16) |
+                                              ((uint32_t)buf[5] << 8) | buf[6];
+                ESP_LOGI(TAG, "OBD PID 0x00 (supported PIDs)   -> bitmask %02x %02x %02x %02x",
+                         buf[3], buf[4], buf[5], buf[6]);
             }
             break;
         case 0x05:
@@ -249,6 +305,11 @@ static void obd_query_task(void *arg)
 
     while (1) {
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
+            if (s_can_passive) {
+                vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+                continue;
+            }
+
             uint8_t request[8] = { 0x02, OBD_MODE_CURRENT_DATA, pids[i], 0, 0, 0, 0, 0 };
             mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
 
@@ -284,11 +345,32 @@ static void start_can_bridge(void)
     }
 
     s_obd_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
+    if (s_obd_response_queue == NULL) {
+        ESP_LOGE(TAG, "CAN bridge queue allocation failed");
+        return;
+    }
 
-    xTaskCreate(can_echo_task, "can_echo", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+    gpio_config_t int_conf = {
+        .pin_bit_mask = (1ULL << CAN_INT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&int_conf));
+    esp_err_t isr_result = gpio_install_isr_service(0);
+    if (isr_result != ESP_OK && isr_result != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_result);
+    }
+    if (xTaskCreate(can_echo_task, "can_echo", 4096, NULL, tskIDLE_PRIORITY + 1,
+                    &s_can_rx_task) != pdPASS) {
+        ESP_LOGE(TAG, "CAN receive task allocation failed");
+        return;
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(CAN_INT_GPIO, can_int_isr, NULL));
     xTaskCreate(obd_query_task, "obd_query", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-    ESP_LOGI(TAG, "CAN bridge ready: echoing received frames (test id=0x%03x), OBD-II scan tool querying PIDs",
-             CAN_TEST_ID);
+    ESP_LOGI(TAG, "CAN bridge ready: INT on GPIO%d, capturing broadcasts, echoing test id=0x%03x, querying OBD-II",
+             CAN_INT_GPIO, CAN_TEST_ID);
 }
 
 static void cdc_send(const char *msg)
@@ -417,11 +499,111 @@ static esp_err_t obd_http_handler(httpd_req_t *request)
     obd_state_t state = s_obd_state;
     char response[192];
     snprintf(response, sizeof(response),
-             "{\"supported_pids\":\"%06lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
-             (unsigned long)(state.supported_pids & 0xFFFFFF), state.coolant_c,
+             "{\"supported_pids\":\"%08lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
+             (unsigned long)state.supported_pids, state.coolant_c,
              state.rpm, state.speed_kmh, state.throttle_pct);
     httpd_resp_set_type(request, "application/json");
     httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+static esp_err_t can_capture_http_handler(httpd_req_t *request)
+{
+    uint64_t after = 0;
+    char query[48];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        char value[24];
+        if (httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK) {
+            after = strtoull(value, NULL, 10);
+        }
+    }
+
+    can_capture_frame_t batch[CAN_CAPTURE_HTTP_BATCH];
+    size_t count = 0;
+    uint64_t latest;
+    uint64_t dropped = 0;
+
+    portENTER_CRITICAL(&s_can_capture_lock);
+    latest = s_can_capture_sequence;
+    uint64_t oldest = latest >= CAN_CAPTURE_CAPACITY ? latest - CAN_CAPTURE_CAPACITY + 1 : 1;
+    uint64_t first = after + 1;
+    if (first < oldest) {
+        dropped = oldest - first;
+        first = oldest;
+    }
+    for (uint64_t sequence = first; sequence <= latest && count < CAN_CAPTURE_HTTP_BATCH; sequence++) {
+        can_capture_frame_t frame = s_can_capture[(sequence - 1) % CAN_CAPTURE_CAPACITY];
+        if (frame.sequence == sequence) {
+            batch[count++] = frame;
+        }
+    }
+    portEXIT_CRITICAL(&s_can_capture_lock);
+
+    char *response = malloc(CAN_CAPTURE_RESPONSE_SIZE);
+    if (response == NULL) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t used = (size_t)snprintf(response, CAN_CAPTURE_RESPONSE_SIZE,
+                                   "{\"latest\":%llu,\"dropped\":%llu,\"hardware_overflow\":%lu,"
+                                   "\"passive\":%s,\"frames\":[",
+                                   (unsigned long long)latest, (unsigned long long)dropped,
+                                   (unsigned long)mcp2515_get_receive_overflow_count(),
+                                   s_can_passive ? "true" : "false");
+    for (size_t i = 0; i < count; i++) {
+        can_capture_frame_t *frame = &batch[i];
+        used += (size_t)snprintf(response + used, CAN_CAPTURE_RESPONSE_SIZE - used,
+                                 "%s{\"seq\":%llu,\"time_us\":%lld,\"bus\":0,\"id\":%lu,"
+                                 "\"extended\":false,\"rtr\":false,\"dlc\":%u,\"data\":\"",
+                                 i == 0 ? "" : ",", (unsigned long long)frame->sequence,
+                                 (long long)frame->timestamp_us, (unsigned long)frame->id, frame->dlc);
+        for (uint8_t j = 0; j < frame->dlc && used + 2 < CAN_CAPTURE_RESPONSE_SIZE; j++) {
+            used += (size_t)snprintf(response + used, CAN_CAPTURE_RESPONSE_SIZE - used,
+                                     "%02X", frame->data[j]);
+        }
+        used += (size_t)snprintf(response + used, CAN_CAPTURE_RESPONSE_SIZE - used, "\"}");
+    }
+    snprintf(response + used, CAN_CAPTURE_RESPONSE_SIZE - used, "]}");
+
+    httpd_resp_set_type(request, "application/json");
+    esp_err_t result = httpd_resp_sendstr(request, response);
+    free(response);
+    return result;
+}
+
+static esp_err_t can_mode_http_handler(httpd_req_t *request)
+{
+    char mode[16] = {0};
+    int received = httpd_req_recv(request, mode, sizeof(mode) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected active or passive");
+        return ESP_FAIL;
+    }
+    mode[received] = '\0';
+
+    bool passive;
+    if (strcmp(mode, "passive") == 0) {
+        passive = true;
+    } else if (strcmp(mode, "active") == 0) {
+        passive = false;
+    } else {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected active or passive");
+        return ESP_FAIL;
+    }
+
+    if (mcp2515_set_listen_only(passive) != ESP_OK) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "CAN mode change failed");
+        return ESP_FAIL;
+    }
+
+    s_can_passive = passive;
+    if (!passive) {
+        xQueueReset(s_obd_response_queue);
+    }
+    ESP_LOGI(TAG, "CAN mode changed to %s", passive ? "passive" : "active");
+    httpd_resp_set_type(request, "text/plain");
+    httpd_resp_sendstr(request, passive ? "OK passive" : "OK active");
     return ESP_OK;
 }
 
@@ -442,12 +624,26 @@ static void start_frequency_http_server(void)
         .method = HTTP_GET,
         .handler = obd_http_handler,
     };
+    httpd_uri_t can_capture_uri = {
+        .uri = "/api/can",
+        .method = HTTP_GET,
+        .handler = can_capture_http_handler,
+    };
+    httpd_uri_t can_mode_uri = {
+        .uri = "/api/can/mode",
+        .method = HTTP_POST,
+        .handler = can_mode_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
         httpd_register_uri_handler(http_server, &obd_uri);
+        httpd_register_uri_handler(http_server, &can_capture_uri);
+        httpd_register_uri_handler(http_server, &can_mode_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
+        ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
+        ESP_LOGI(TAG, "CAN mode API ready: POST /api/can/mode");
     }
 }
 

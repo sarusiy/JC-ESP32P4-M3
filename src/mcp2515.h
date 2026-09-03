@@ -26,5 +26,11 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config);
 /* Non-blocking poll. Returns true and fills outputs if a frame was pending. */
 bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data);
 
+/* Number of RX buffers that overflowed since initialization. */
+uint32_t mcp2515_get_receive_overflow_count(void);
+
+/* Selects passive listen-only mode or normal active CAN operation. */
+esp_err_t mcp2515_set_listen_only(bool enabled);
+
 /* Sends a standard-ID frame via TXB0 (fire-and-forget, no confirmation wait). */
 esp_err_t mcp2515_send(uint32_t id, uint8_t dlc, const uint8_t *data);
