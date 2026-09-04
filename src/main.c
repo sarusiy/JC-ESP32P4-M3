@@ -161,6 +161,7 @@ typedef struct {
 #define CAN_CAPTURE_CAPACITY 256
 #define CAN_CAPTURE_HTTP_BATCH 32
 #define CAN_CAPTURE_RESPONSE_SIZE 8192
+#define TASKS_RESPONSE_SIZE 8192
 
 static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
 static uint64_t s_can_capture_sequence;
@@ -677,6 +678,18 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
     }
 }
 
+static const char *task_state_to_string(eTaskState state)
+{
+    switch (state) {
+        case eRunning: return "running";
+        case eReady: return "ready";
+        case eBlocked: return "blocked";
+        case eSuspended: return "suspended";
+        case eDeleted: return "deleted";
+        default: return "unknown";
+    }
+}
+
 static uint32_t get_partitioned_flash_size(void)
 {
     uint32_t total = 0;
@@ -1055,6 +1068,43 @@ static esp_err_t health_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+static esp_err_t tasks_http_handler(httpd_req_t *request)
+{
+    UBaseType_t task_count = uxTaskGetNumberOfTasks();
+    TaskStatus_t *tasks = calloc(task_count, sizeof(TaskStatus_t));
+    char *response = malloc(TASKS_RESPONSE_SIZE);
+    if (tasks == NULL || response == NULL) {
+        free(tasks);
+        free(response);
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    UBaseType_t count = uxTaskGetSystemState(tasks, task_count, NULL);
+    size_t used = (size_t)snprintf(response, TASKS_RESPONSE_SIZE,
+                                   "{\"count\":%lu,\"tasks\":[", (unsigned long)count);
+    for (UBaseType_t i = 0; i < count && used < TASKS_RESPONSE_SIZE; i++) {
+        TaskStatus_t *task = &tasks[i];
+        used += (size_t)snprintf(response + used, TASKS_RESPONSE_SIZE - used,
+                                 "%s{\"name\":\"%s\",\"priority\":%lu,"
+                                 "\"base_priority\":%lu,\"state\":\"%s\","
+                                 "\"stack_high_watermark\":%lu}",
+                                 i == 0 ? "" : ",",
+                                 task->pcTaskName,
+                                 (unsigned long)task->uxCurrentPriority,
+                                 (unsigned long)task->uxBasePriority,
+                                 task_state_to_string(task->eCurrentState),
+                                 (unsigned long)task->usStackHighWaterMark);
+    }
+    snprintf(response + used, TASKS_RESPONSE_SIZE - used, "]}");
+
+    httpd_resp_set_type(request, "application/json");
+    esp_err_t result = httpd_resp_sendstr(request, response);
+    free(tasks);
+    free(response);
+    return result;
+}
+
 static void start_frequency_http_server(void)
 {
     if (http_server != NULL) {
@@ -1092,6 +1142,11 @@ static void start_frequency_http_server(void)
         .method = HTTP_GET,
         .handler = health_http_handler,
     };
+    httpd_uri_t tasks_uri = {
+        .uri = "/api/tasks",
+        .method = HTTP_GET,
+        .handler = tasks_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -1100,12 +1155,14 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &can_mode_uri);
         httpd_register_uri_handler(http_server, &gps_uri);
         httpd_register_uri_handler(http_server, &health_uri);
+        httpd_register_uri_handler(http_server, &tasks_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
         ESP_LOGI(TAG, "CAN mode API ready: POST /api/can/mode");
         ESP_LOGI(TAG, "GPS API ready: GET /api/gps");
         ESP_LOGI(TAG, "Health API ready: GET /api/health");
+        ESP_LOGI(TAG, "Tasks API ready: GET /api/tasks");
     }
 }
 
