@@ -2,10 +2,12 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -14,7 +16,12 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_hosted.h"
+#include "esp_freertos_hooks.h"
+#include "esp_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 #include "nimble/ble.h"
@@ -52,6 +59,22 @@
 #endif
 #define CAN_TEST_ID 0x100
 
+/* Simulated GPS UART wiring on JP1 (see Doc/GPS_SIMULATION_AND_INTEGRATION_REQUIREMENTS.md).
+ * GPIO34/35 are free on the same header as the MCP2515 wiring above. The
+ * Arduino simulator's SoftwareSerial TX is 5V logic and is stepped down to
+ * GPIO34 with a 10k/15k divider, matching the CAN SO/INT dividers. */
+#ifndef GPS_UART_RX_GPIO
+#define GPS_UART_RX_GPIO 34
+#endif
+#ifndef GPS_UART_TX_GPIO
+#define GPS_UART_TX_GPIO 35
+#endif
+#define GPS_UART_NUM UART_NUM_1
+#define GPS_UART_BAUD 9600
+
+/* Quarter-dBm units: 40 = 10 dBm. Reduces Wi-Fi current spikes on USB-powered bench setups. */
+#define WIFI_MAX_TX_POWER_QDBM 40
+
 /* OBD-II (SAE J1979) scan-tool request/response IDs, matching the simulated
  * ECU in the ArdunioUsbBridgeToCan repo. */
 #define OBD_REQUEST_ID 0x7DF
@@ -81,6 +104,46 @@ typedef struct {
 } obd_state_t;
 
 static obd_state_t s_obd_state;
+
+typedef struct {
+    uint32_t idle0_pct;
+    uint32_t idle1_pct;
+    uint32_t idle0_delta;
+    uint32_t idle1_delta;
+    uint32_t idle0_max_delta;
+    uint32_t idle1_max_delta;
+    size_t heap_free;
+    size_t heap_min_free;
+    size_t internal_free;
+    size_t internal_min_free;
+    size_t psram_free;
+    size_t psram_min_free;
+    uint32_t flash_size;
+    uint32_t flash_partitioned;
+    uint32_t app_partition_size;
+    uint32_t uptime_s;
+    esp_reset_reason_t restart_reason;
+} health_state_t;
+
+static health_state_t s_health_state;
+static portMUX_TYPE s_health_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_idle0_count;
+static volatile uint32_t s_idle1_count;
+
+typedef struct {
+    bool fix_valid;
+    double lat;
+    double lon;
+    float speed_kmh;
+    float heading_deg;
+    char utc_time[8];
+    char utc_date[8];
+    uint8_t satellites;
+} gps_state_t;
+
+static gps_state_t s_gps_state;
+static portMUX_TYPE s_gps_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_last_gps_log_us;
 
 typedef struct {
     uint8_t dlc;
@@ -381,6 +444,326 @@ static void start_can_bridge(void)
              CAN_INT_GPIO, CAN_TEST_ID);
 }
 
+/* Converts NMEA "ddmm.mmmm"/"dddmm.mmmm" plus hemisphere letter to signed
+ * decimal degrees. Returns NAN on malformed input. */
+static double nmea_coord_to_decimal(const char *value, char hemisphere)
+{
+    if (value == NULL || value[0] == '\0') {
+        return NAN;
+    }
+
+    char *dot = strchr(value, '.');
+    if (dot == NULL || (dot - value) < 2) {
+        return NAN;
+    }
+
+    int degree_digits = (int)(dot - value) - 2;
+    char degree_buf[4] = {0};
+    if (degree_digits < 0 || degree_digits >= (int)sizeof(degree_buf)) {
+        return NAN;
+    }
+    memcpy(degree_buf, value, degree_digits);
+
+    double degrees_part = atof(degree_buf);
+    double minutes_part = atof(value + degree_digits);
+    double decimal = degrees_part + minutes_part / 60.0;
+
+    if (hemisphere == 'S' || hemisphere == 'W') {
+        decimal = -decimal;
+    }
+    return decimal;
+}
+
+/* Splits an NMEA sentence body (already stripped of leading '$' and the
+ * trailing "*checksum") into up to max_fields comma-separated fields. Empty
+ * fields between consecutive commas become empty strings, not skipped. */
+static size_t nmea_split_fields(char *body, char **fields, size_t max_fields)
+{
+    size_t count = 0;
+    char *field = body;
+    while (count < max_fields) {
+        fields[count++] = field;
+        char *comma = strchr(field, ',');
+        if (comma == NULL) {
+            break;
+        }
+        *comma = '\0';
+        field = comma + 1;
+    }
+    return count;
+}
+
+/* buf[0]="GPRMC", [1]=time, [2]=status A/V, [3]=lat, [4]=N/S, [5]=lon,
+ * [6]=E/W, [7]=speed_knots, [8]=heading_deg, [9]=date. */
+static void nmea_parse_rmc(char **fields, size_t count)
+{
+    if (count < 10) {
+        return;
+    }
+
+    bool fix_valid = (fields[2][0] == 'A');
+    double lat = NAN;
+    double lon = NAN;
+    float speed_kmh = 0;
+    float heading_deg = 0;
+    if (fix_valid) {
+        lat = nmea_coord_to_decimal(fields[3], fields[4][0]);
+        lon = nmea_coord_to_decimal(fields[5], fields[6][0]);
+        speed_kmh = (float)(atof(fields[7]) * 1.852);
+        heading_deg = (float)atof(fields[8]);
+    }
+
+    portENTER_CRITICAL(&s_gps_lock);
+    s_gps_state.fix_valid = fix_valid;
+    if (fix_valid) {
+        s_gps_state.lat = lat;
+        s_gps_state.lon = lon;
+        s_gps_state.speed_kmh = speed_kmh;
+        s_gps_state.heading_deg = heading_deg;
+    }
+    snprintf(s_gps_state.utc_time, sizeof(s_gps_state.utc_time), "%s", fields[1]);
+    snprintf(s_gps_state.utc_date, sizeof(s_gps_state.utc_date), "%s", fields[9]);
+    portEXIT_CRITICAL(&s_gps_lock);
+
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s_last_gps_log_us >= 1000000) {
+        s_last_gps_log_us = now_us;
+        if (fix_valid) {
+            ESP_LOGI(TAG, "GPS fix -> lat=%.6f lon=%.6f speed=%.1f km/h heading=%.1f deg utc=%s date=%s",
+                     lat, lon, (double)speed_kmh, (double)heading_deg, fields[1], fields[9]);
+        } else {
+            ESP_LOGI(TAG, "GPS fix -> waiting for valid fix utc=%s date=%s", fields[1], fields[9]);
+        }
+    }
+}
+
+/* buf[0]="GPGGA", [1]=time, [2]=lat, [3]=N/S, [4]=lon, [5]=E/W,
+ * [6]=fix_quality, [7]=satellites. */
+static void nmea_parse_gga(char **fields, size_t count)
+{
+    if (count < 8) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_gps_lock);
+    s_gps_state.satellites = (uint8_t)atoi(fields[7]);
+    portEXIT_CRITICAL(&s_gps_lock);
+    (void)fields[6];
+}
+
+/* Validates the NMEA checksum (XOR of all bytes between '$' and '*') before
+ * handing the sentence to a talker-specific parser. */
+static void nmea_parse_line(char *line)
+{
+    if (line[0] != '$') {
+        return;
+    }
+
+    char *star = strchr(line, '*');
+    if (star == NULL || strlen(star) < 3) {
+        ESP_LOGW(TAG, "GPS: malformed sentence (no checksum)");
+        return;
+    }
+
+    uint8_t checksum = 0;
+    for (char *p = line + 1; p < star; p++) {
+        checksum ^= (uint8_t)*p;
+    }
+    uint8_t expected = (uint8_t)strtol(star + 1, NULL, 16);
+    if (checksum != expected) {
+        ESP_LOGW(TAG, "GPS: checksum mismatch");
+        return;
+    }
+    *star = '\0';
+
+    char *fields[12];
+    size_t count = nmea_split_fields(line + 1, fields, 12);
+    if (count == 0) {
+        return;
+    }
+
+    if (strcmp(fields[0], "GPRMC") == 0) {
+        nmea_parse_rmc(fields, count);
+    } else if (strcmp(fields[0], "GPGGA") == 0) {
+        nmea_parse_gga(fields, count);
+    }
+}
+
+/* Reads raw bytes from the GPS UART and reassembles them into '\n'-terminated
+ * NMEA lines before parsing; NMEA sentences are short so a single-line buffer
+ * is enough. */
+static void gps_uart_task(void *arg)
+{
+    (void)arg;
+    static char line_buf[96];
+    size_t line_len = 0;
+    uint8_t rx_buf[64];
+
+    while (1) {
+        int read = uart_read_bytes(GPS_UART_NUM, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(200));
+        for (int i = 0; i < read; i++) {
+            char c = (char)rx_buf[i];
+            if (c == '\r') {
+                continue;
+            }
+            if (c == '\n') {
+                if (line_len > 0) {
+                    line_buf[line_len] = '\0';
+                    nmea_parse_line(line_buf);
+                    line_len = 0;
+                }
+                continue;
+            }
+            if (line_len < sizeof(line_buf) - 1) {
+                line_buf[line_len++] = c;
+            } else {
+                /* Line too long for the buffer; discard it and resync on the next '\n'. */
+                line_len = 0;
+            }
+        }
+    }
+}
+
+static void start_gps_bridge(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = GPS_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(GPS_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_UART_TX_GPIO, GPS_UART_RX_GPIO,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    if (xTaskCreate(gps_uart_task, "gps_uart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "GPS UART task allocation failed");
+        return;
+    }
+    ESP_LOGI(TAG, "GPS bridge ready: UART1 RX on GPIO%d, TX on GPIO%d, %d baud",
+             GPS_UART_RX_GPIO, GPS_UART_TX_GPIO, GPS_UART_BAUD);
+}
+
+static bool health_idle0_hook(void)
+{
+    s_idle0_count++;
+    return false;
+}
+
+static bool health_idle1_hook(void)
+{
+    s_idle1_count++;
+    return false;
+}
+
+static const char *reset_reason_to_string(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
+
+static uint32_t get_partitioned_flash_size(void)
+{
+    uint32_t total = 0;
+    esp_partition_iterator_t iterator = esp_partition_find(ESP_PARTITION_TYPE_ANY,
+                                                           ESP_PARTITION_SUBTYPE_ANY, NULL);
+    while (iterator != NULL) {
+        const esp_partition_t *partition = esp_partition_get(iterator);
+        if (partition != NULL) {
+            total += partition->size;
+        }
+        iterator = esp_partition_next(iterator);
+    }
+    esp_partition_iterator_release(iterator);
+    return total;
+}
+
+static void health_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_idle0 = s_idle0_count;
+    uint32_t last_idle1 = s_idle1_count;
+    uint32_t max_idle0_delta = 1;
+    uint32_t max_idle1_delta = 1;
+    uint32_t flash_size = 0;
+    esp_flash_get_size(NULL, &flash_size);
+    uint32_t flash_partitioned = get_partitioned_flash_size();
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    uint32_t app_partition_size = running_partition == NULL ? 0 : running_partition->size;
+    esp_reset_reason_t restart_reason = esp_reset_reason();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        uint32_t idle0 = s_idle0_count;
+        uint32_t idle1 = s_idle1_count;
+        uint32_t idle0_delta = idle0 - last_idle0;
+        uint32_t idle1_delta = idle1 - last_idle1;
+        last_idle0 = idle0;
+        last_idle1 = idle1;
+        if (idle0_delta > max_idle0_delta) {
+            max_idle0_delta = idle0_delta;
+        }
+        if (idle1_delta > max_idle1_delta) {
+            max_idle1_delta = idle1_delta;
+        }
+
+        health_state_t state = {
+            .idle0_pct = (idle0_delta * 100u) / max_idle0_delta,
+            .idle1_pct = (idle1_delta * 100u) / max_idle1_delta,
+            .idle0_delta = idle0_delta,
+            .idle1_delta = idle1_delta,
+            .idle0_max_delta = max_idle0_delta,
+            .idle1_max_delta = max_idle1_delta,
+            .heap_free = esp_get_free_heap_size(),
+            .heap_min_free = esp_get_minimum_free_heap_size(),
+            .internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            .internal_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+            .psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            .psram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+            .flash_size = flash_size,
+            .flash_partitioned = flash_partitioned,
+            .app_partition_size = app_partition_size,
+            .uptime_s = (uint32_t)(esp_timer_get_time() / 1000000),
+            .restart_reason = restart_reason,
+        };
+
+        portENTER_CRITICAL(&s_health_lock);
+        s_health_state = state;
+        portEXIT_CRITICAL(&s_health_lock);
+
+        ESP_LOGI(TAG, "HEALTH uptime=%lus heap=%u/%u internal=%u/%u psram=%u/%u idle=%lu%%/%lu%% restart=%s",
+                 (unsigned long)state.uptime_s,
+                 (unsigned int)state.heap_free, (unsigned int)state.heap_min_free,
+                 (unsigned int)state.internal_free, (unsigned int)state.internal_min_free,
+                 (unsigned int)state.psram_free, (unsigned int)state.psram_min_free,
+                 (unsigned long)state.idle0_pct, (unsigned long)state.idle1_pct,
+                 reset_reason_to_string(state.restart_reason));
+    }
+}
+
+static void start_health_monitor(void)
+{
+    ESP_ERROR_CHECK(esp_register_freertos_idle_hook_for_cpu(health_idle0_hook, 0));
+    ESP_ERROR_CHECK(esp_register_freertos_idle_hook_for_cpu(health_idle1_hook, 1));
+    xTaskCreate(health_task, "health", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
+}
+
 static void cdc_send(const char *msg)
 {
     tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)msg, strlen(msg));
@@ -616,6 +999,62 @@ static esp_err_t can_mode_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+static esp_err_t gps_http_handler(httpd_req_t *request)
+{
+    gps_state_t state;
+    portENTER_CRITICAL(&s_gps_lock);
+    state = s_gps_state;
+    portEXIT_CRITICAL(&s_gps_lock);
+
+    char response[256];
+    snprintf(response, sizeof(response),
+             "{\"fix_valid\":%s,\"lat\":%.6f,\"lon\":%.6f,\"speed_kmh\":%.1f,"
+             "\"heading_deg\":%.1f,\"utc_time\":\"%s\",\"utc_date\":\"%s\",\"satellites\":%u}",
+             state.fix_valid ? "true" : "false", state.lat, state.lon,
+             (double)state.speed_kmh, (double)state.heading_deg,
+             state.utc_time, state.utc_date, state.satellites);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+static esp_err_t health_http_handler(httpd_req_t *request)
+{
+    health_state_t state;
+    portENTER_CRITICAL(&s_health_lock);
+    state = s_health_state;
+    portEXIT_CRITICAL(&s_health_lock);
+
+    uint32_t flash_free = state.flash_size > state.flash_partitioned
+                              ? state.flash_size - state.flash_partitioned
+                              : 0;
+    char response[512];
+    snprintf(response, sizeof(response),
+             "{\"uptime_s\":%lu,\"restart_reason\":\"%s\"," 
+             "\"heap_free\":%u,\"heap_min_free\":%u,"
+             "\"internal_free\":%u,\"internal_min_free\":%u,"
+             "\"psram_free\":%u,\"psram_min_free\":%u,"
+             "\"flash_size\":%lu,\"flash_partitioned\":%lu,\"flash_free\":%lu,"
+             "\"app_partition_size\":%lu,"
+             "\"idle0_pct\":%lu,\"idle1_pct\":%lu,"
+             "\"busy0_pct\":%lu,\"busy1_pct\":%lu,"
+             "\"idle0_delta\":%lu,\"idle1_delta\":%lu,"
+             "\"idle0_max_delta\":%lu,\"idle1_max_delta\":%lu}",
+             (unsigned long)state.uptime_s, reset_reason_to_string(state.restart_reason),
+             (unsigned int)state.heap_free, (unsigned int)state.heap_min_free,
+             (unsigned int)state.internal_free, (unsigned int)state.internal_min_free,
+             (unsigned int)state.psram_free, (unsigned int)state.psram_min_free,
+             (unsigned long)state.flash_size, (unsigned long)state.flash_partitioned,
+             (unsigned long)flash_free, (unsigned long)state.app_partition_size,
+             (unsigned long)state.idle0_pct, (unsigned long)state.idle1_pct,
+             (unsigned long)(100u - state.idle0_pct), (unsigned long)(100u - state.idle1_pct),
+             (unsigned long)state.idle0_delta, (unsigned long)state.idle1_delta,
+             (unsigned long)state.idle0_max_delta, (unsigned long)state.idle1_max_delta);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static void start_frequency_http_server(void)
 {
     if (http_server != NULL) {
@@ -643,16 +1082,30 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = can_mode_http_handler,
     };
+    httpd_uri_t gps_uri = {
+        .uri = "/api/gps",
+        .method = HTTP_GET,
+        .handler = gps_http_handler,
+    };
+    httpd_uri_t health_uri = {
+        .uri = "/api/health",
+        .method = HTTP_GET,
+        .handler = health_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
         httpd_register_uri_handler(http_server, &obd_uri);
         httpd_register_uri_handler(http_server, &can_capture_uri);
         httpd_register_uri_handler(http_server, &can_mode_uri);
+        httpd_register_uri_handler(http_server, &gps_uri);
+        httpd_register_uri_handler(http_server, &health_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
         ESP_LOGI(TAG, "CAN mode API ready: POST /api/can/mode");
+        ESP_LOGI(TAG, "GPS API ready: GET /api/gps");
+        ESP_LOGI(TAG, "Health API ready: GET /api/health");
     }
 }
 
@@ -795,6 +1248,13 @@ static void start_hosted_wifi_link(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
         return;
+    }
+
+    err = esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi max TX power limited to %.2f dBm", WIFI_MAX_TX_POWER_QDBM / 4.0f);
+    } else {
+        ESP_LOGW(TAG, "WiFi TX power limit failed: %s", esp_err_to_name(err));
     }
 
     wifi_started = true;
@@ -1027,6 +1487,7 @@ void app_main(void)
 
     init_led();
     esp_log_level_set(TAG, s_log_level);
+    start_health_monitor();
 
     ESP_LOGI(TAG, "JC-ESP32P4-M3 booted. Blinking LED on GPIO %d", LED_GPIO);
     ESP_LOGI(TAG, "Free heap before hosted init: %lu bytes (internal: %lu)",
@@ -1037,6 +1498,7 @@ void app_main(void)
     start_hosted_wifi_link();
     start_ble_hosted();
     start_can_bridge();
+    start_gps_bridge();
 
     uint32_t count = 0;
     while (1) {
