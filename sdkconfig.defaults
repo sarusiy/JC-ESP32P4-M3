@@ -19,8 +19,24 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 CONFIG_LOG_COLORS=y
 
-# Required by /api/tasks for runtime task names, priorities, states, and stack high-water marks.
-CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+# /api/tasks would like this for runtime task names, priorities, states, and
+# stack high-water marks, but it is deliberately left OFF here: enabling it on
+# this esp32p4 rev-<v3 board reduces the "RETENT_RAM" heap region enough to
+# shift which early-boot failure mode manifests (see PM_SLEEP_CLK_ICG_ENABLE
+# note below for the actual root cause). src/main.c's tasks_http_handler()
+# degrades gracefully (HTTP 501) when this is off, so it's left disabled here
+# as a safety margin rather than risking another RETENT_RAM squeeze.
+# CONFIG_FREERTOS_USE_TRACE_FACILITY is not set
+
+# This board never uses Light Sleep (CONFIG_PM_ENABLE is off), so the
+# PMU sleep-clock-ICG REGDMA retention feature this option enables is unused
+# dead weight. On this esp32p4 rev-<v3 chip + ESP-IDF v6.1-beta combo its
+# early-boot init is buggy and crash-loops the board every single boot
+# (`sleep_clock_icg_startup_init ... has failed (0x101)` / `assert failed:
+# entries_destroy ...`), before app_main() or any app code ever runs.
+# Disabling it excludes the faulty pmu_sleep_clock_icg.c from the build
+# entirely. Confirmed via 6x back-to-back hardware resets: zero crashes.
+# CONFIG_PM_SLEEP_CLK_ICG_ENABLE is not set
 
 # Make the USB-Serial/JTAG port (used for flashing/monitoring, e.g. COM3) the
 # primary console so it receives stdin too; the default UART0 console is

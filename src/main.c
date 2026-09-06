@@ -1109,6 +1109,21 @@ static esp_err_t health_http_handler(httpd_req_t *request)
 
 static esp_err_t tasks_http_handler(httpd_req_t *request)
 {
+#if !CONFIG_FREERTOS_USE_TRACE_FACILITY
+    /* uxTaskGetSystemState() is only linkable when CONFIG_FREERTOS_USE_TRACE_FACILITY
+     * is enabled. That option adds per-task tracing fields that increase FreeRTOS's
+     * static kernel memory footprint, which on this esp32p4 rev-<v3 board shrinks the
+     * "RETENT_RAM" heap region enough to shift which early-boot failure manifests.
+     * The actual root cause (an unused PMU sleep-clock-ICG REGDMA retention path,
+     * see CONFIG_PM_SLEEP_CLK_ICG_ENABLE in sdkconfig.defaults) is now fixed
+     * separately, but trace facility is kept off here as a safety margin against
+     * further RETENT_RAM squeezes rather than trading a working board for a task
+     * list. Degrade this one endpoint gracefully instead. */
+    httpd_resp_set_status(request, "501 Not Implemented");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"error\":\"CONFIG_FREERTOS_USE_TRACE_FACILITY is disabled on this build\"}");
+    return ESP_OK;
+#else
     UBaseType_t task_count = uxTaskGetNumberOfTasks();
     TaskStatus_t *tasks = calloc(task_count, sizeof(TaskStatus_t));
     char *response = malloc(TASKS_RESPONSE_SIZE);
@@ -1142,6 +1157,7 @@ static esp_err_t tasks_http_handler(httpd_req_t *request)
     free(tasks);
     free(response);
     return result;
+#endif
 }
 
 static void start_frequency_http_server(void)
