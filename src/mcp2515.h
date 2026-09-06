@@ -20,7 +20,9 @@ typedef struct {
     int cs_gpio;
 } mcp2515_config_t;
 
-/* Resets the chip, configures 500 kbps @ 8 MHz, receive-all filters, normal mode. */
+/* Resets the chip, configures 500 kbps @ 8 MHz, receive-all filters, and
+ * starts in safe listen-only mode so it does not transmit until explicitly
+ * switched back to active mode. */
 esp_err_t mcp2515_init(const mcp2515_config_t *config);
 
 /* Non-blocking poll. Returns true and fills outputs if a frame was pending. */

@@ -167,7 +167,7 @@ static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
 static uint64_t s_can_capture_sequence;
 static portMUX_TYPE s_can_capture_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_can_rx_task;
-static volatile bool s_can_passive;
+static volatile bool s_can_passive = true;
 
 /* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
 static QueueHandle_t s_obd_response_queue;
@@ -206,6 +206,14 @@ static void IRAM_ATTR can_int_isr(void *arg)
 
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 static void ble_publish_response(uint16_t conn_handle, const char *message);
+
+/* Last known Wi-Fi IP, set once by wifi_event_handler on IP_EVENT_STA_GOT_IP.
+ * The board joins Wi-Fi (auto-reconnecting from NVS-saved credentials) well
+ * before a phone typically re-pairs over BLE, so the one-shot "WiFi connected
+ * ip=..." notify fires and is missed if nobody is subscribed yet. Caching the
+ * IP here lets ble_gap_event() resend it the moment a central (re)subscribes,
+ * without requiring the user to re-provision Wi-Fi credentials every time. */
+static char s_wifi_ip[16];
 #endif
 
 /* Shared command parser used by USB CDC and future companion transport. */
@@ -284,6 +292,11 @@ static void init_led(void)
     gpio_config(&io_conf);
 }
 
+/* Forward declaration: defined below, shared by both the active-mode
+ * request/response path (obd_query_task) and the passive-mode broadcast
+ * capture path (can_echo_task) so a single decoder feeds s_obd_state either way. */
+static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len);
+
 /* Phase 1 echo test frames get echoed back; OBD-II responses get routed to
  * obd_query_task via a queue instead of being echoed. Single task owns the
  * MCP2515 RX poll so the two consumers never race for the same frame. */
@@ -300,11 +313,29 @@ static void can_echo_task(void *arg)
         }
         /* Drain both hardware RX buffers before sleeping; otherwise a second
          * frame arriving while the first is still pending gets left behind
-         * and can overflow/reorder under back-to-back multi-frame traffic. */
-        while (mcp2515_receive(&id, &dlc, data)) {
+         * and can overflow/reorder under back-to-back multi-frame traffic.
+         * Bounded to one batch's worth per wake-up: a two-node bus with a
+         * passive/listen-only receiver never ACKs, so the transmitting node's
+         * own CAN controller auto-retransmits every unacked frame forever,
+         * which can otherwise turn this into an unbounded busy-loop that
+         * starves this task's own 100ms notify cadence (and, on a real bus,
+         * protects against any other pathologically busy traffic burst). */
+        uint32_t drained = 0;
+        while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, &dlc, data)) {
+            drained++;
             capture_can_frame(id, dlc, data);
             if (id == OBD_RESPONSE_ID) {
-                if (!s_can_passive) {
+                if (s_can_passive) {
+                    /* Passive mode never sends the 0x7DF request itself, but if the
+                     * bus carries unsolicited OBD-II broadcasts (e.g. a simulated ECU
+                     * acting like a real car that reports its own PIDs), decode and
+                     * expose them read-only via s_obd_state / GET /api/obd -- exactly
+                     * like the active-mode request/response path below, just without
+                     * ever transmitting anything onto the bus. */
+                    if (dlc >= 3 && data[1] == (uint8_t)(0x40 | OBD_MODE_CURRENT_DATA)) {
+                        obd_print_response(data[2], data, dlc);
+                    }
+                } else {
                     obd_frame_t frame = { .dlc = dlc };
                     memcpy(frame.data, data, sizeof(frame.data));
                     if (xQueueSend(s_obd_response_queue, &frame, 0) != pdPASS) {
@@ -415,6 +446,7 @@ static void start_can_bridge(void)
         ESP_LOGE(TAG, "CAN bridge init failed; check MCP2515 wiring/power");
         return;
     }
+    s_can_passive = true;
 
     s_obd_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
     if (s_obd_response_queue == NULL) {
@@ -441,8 +473,10 @@ static void start_can_bridge(void)
     }
     ESP_ERROR_CHECK(gpio_isr_handler_add(CAN_INT_GPIO, can_int_isr, NULL));
     xTaskCreate(obd_query_task, "obd_query", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-    ESP_LOGI(TAG, "CAN bridge ready: INT on GPIO%d, capturing broadcasts, echoing test id=0x%03x, querying OBD-II",
-             CAN_INT_GPIO, CAN_TEST_ID);
+    ESP_LOGI(TAG, "CAN bridge ready: INT on GPIO%d, default boot mode is PASSIVE listen-only; use POST /api/can/mode with 'active' to enable OBD queries and test echo.",
+             CAN_INT_GPIO);
+    ESP_LOGI(TAG, "CAN bridge ready: capturing broadcasts, echoing test id=0x%03x, querying OBD-II",
+             CAN_TEST_ID);
 }
 
 /* Converts NMEA "ddmm.mmmm"/"dddmm.mmmm" plus hemisphere letter to signed
@@ -674,6 +708,11 @@ static const char *reset_reason_to_string(esp_reset_reason_t reason)
         case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
         case ESP_RST_BROWNOUT: return "BROWNOUT";
         case ESP_RST_SDIO: return "SDIO";
+        case ESP_RST_USB: return "USB";
+        case ESP_RST_JTAG: return "JTAG";
+        case ESP_RST_EFUSE: return "EFUSE";
+        case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
         default: return "UNKNOWN";
     }
 }
@@ -1177,6 +1216,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "WiFi connected, IP: %s", address);
         start_frequency_http_server();
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+        snprintf(s_wifi_ip, sizeof(s_wifi_ip), "%s", address);
         char response[64];
         snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", address);
         ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
@@ -1189,6 +1229,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *event = event_data;
         printf("WiFi disconnected, reason: %d\n", event->reason);
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+        s_wifi_ip[0] = '\0';
         char response[64];
         snprintf(response, sizeof(response), "ERR WiFi disconnected reason=%d\r\n", event->reason);
         ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
@@ -1452,6 +1493,22 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
         s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         ble_start_advertising();
+    } else if (event->type == BLE_GAP_EVENT_SUBSCRIBE) {
+        /* Fires when the phone app finishes subscribing to notifications on the
+         * response characteristic, right after every BLE (re)connect. The board's
+         * one-shot "WiFi connected ip=..." notify (sent once, at boot-time Wi-Fi
+         * join) is otherwise missed whenever the app wasn't already subscribed at
+         * that moment -- which is the common case, since the board auto-reconnects
+         * to saved Wi-Fi credentials on its own well before a phone re-pairs.
+         * Resending the cached IP here means the app learns it on every connect
+         * without the user having to re-enter Wi-Fi credentials just to discover
+         * an IP the board already has. */
+        if (event->subscribe.attr_handle == s_ble_response_handle &&
+            event->subscribe.cur_notify && s_wifi_ip[0] != '\0') {
+            char response[64];
+            snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", s_wifi_ip);
+            ble_publish_response(event->subscribe.conn_handle, response);
+        }
     }
     return 0;
 }

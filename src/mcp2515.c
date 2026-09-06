@@ -26,6 +26,7 @@ static const char *TAG = "mcp2515";
 #define REG_CNF2      0x29
 #define REG_CNF3      0x28
 #define REG_CANINTE   0x2B
+#define REG_CANINTF   0x2C
 #define REG_EFLG      0x2D
 #define REG_RXB0CTRL  0x60
 #define REG_RXB1CTRL  0x70
@@ -33,6 +34,9 @@ static const char *TAG = "mcp2515";
 
 #define EFLG_RX0OVR   0x40
 #define EFLG_RX1OVR   0x80
+
+#define CANINTF_RX0IF 0x01
+#define CANINTF_RX1IF 0x02
 
 #define MODE_CONFIG      0x80
 #define MODE_LISTEN_ONLY 0x60
@@ -184,12 +188,14 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config)
     mcp2515_write_reg(REG_RXB1CTRL, 0x60);
     mcp2515_write_reg(REG_CANINTE, 0x03); /* RX0IE | RX1IE, unused while polling but harmless. */
 
-    if (!mcp2515_set_mode(MODE_NORMAL)) {
-        ESP_LOGE(TAG, "chip did not enter normal mode; check wiring/power");
+    /* Start in listen-only mode by default so the P4 does not transmit on the
+     * vehicle bus during discovery or while it is simply being monitored. */
+    if (!mcp2515_set_mode(MODE_LISTEN_ONLY)) {
+        ESP_LOGE(TAG, "chip did not enter listen-only mode; check wiring/power");
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "MCP2515 ready: 500 kbps (8 MHz osc), normal mode, bit-banged SPI.");
+    ESP_LOGI(TAG, "MCP2515 ready: 500 kbps (8 MHz osc), listen-only mode, bit-banged SPI.");
     return ESP_OK;
 }
 
@@ -211,12 +217,21 @@ bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
         return false;
     }
 
-    /* MCP_READ_RXB0 (0x90) reads RXB0; RXB1 is at +4 (0x94) and auto-clears its own flag. */
-    uint8_t cmd = rxb0_pending ? MCP_READ_RXB0 : (MCP_READ_RXB0 + 4);
+    /* MCP_READ_RXB0 (0x90) reads RXB0; RXB1 is at +4 (0x94). The datasheet says
+     * this instruction auto-clears the associated RXnIF flag once the buffer
+     * is fully read, but that only holds if CS is released for long enough
+     * before the next transaction starts. With bit-banged SPI polling in a
+     * tight loop (no inter-transaction delay) the flag can still read as set
+     * on the very next status check, causing the same stale buffer to be
+     * read repeatedly. Explicitly clear the flag via Bit Modify below so the
+     * receive loop can never get stuck spinning on one buffered frame. */
+    bool use_rxb0 = rxb0_pending;
+    uint8_t cmd = use_rxb0 ? MCP_READ_RXB0 : (MCP_READ_RXB0 + 4);
     uint8_t tx[14] = {0};
     uint8_t rx[14] = {0};
     tx[0] = cmd;
     mcp2515_cmd(tx, rx, sizeof(tx));
+    mcp2515_bit_modify(REG_CANINTF, use_rxb0 ? CANINTF_RX0IF : CANINTF_RX1IF, 0);
 
     uint8_t sidh = rx[1];
     uint8_t sidl = rx[2];

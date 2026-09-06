@@ -197,6 +197,22 @@ CarTheftGuard must:
 - End-to-end P4 TX -> Arduino RX validation command/ack path.
 - Android runtime validation on phone with the GPS-enabled APK.
 
+## Passive-mode bench test
+
+The normal Arduino simulator requires CAN acknowledgements and therefore cannot
+keep transmitting when the P4 is in MCP2515 listen-only mode by itself. A
+dedicated PlatformIO environment enables MCP2515 one-shot transmission:
+
+```text
+cd C:\projects\ArdunioUsbBridgeToCan
+py -3.11 -m platformio run -e uno_passive_test -t upload --upload-port COM4
+```
+
+This mode transmits each simulator frame once without automatic retransmission
+when no ACK is present. It allows the passive P4 to receive and record Arduino
+broadcast traffic without a third CAN interface. It is a bench test mode only;
+it does not emulate a fully acknowledged multi-node CAN network.
+
 ## Recommended implementation phases
 
 1. Wire the confirmed P4 GPS UART pair (GPIO34 RX via 10K/15K divider, GPIO35 TX

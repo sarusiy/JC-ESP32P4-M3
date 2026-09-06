@@ -106,6 +106,106 @@
       "isBackground": true
     },
     {
+      "label": "can-mode-passive",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$ErrorActionPreference='Stop'; $board='${input:boardIp}'; Invoke-RestMethod -Uri \"http://$board/api/can/mode\" -Method Post -ContentType 'text/plain' -Body 'passive' | Write-Host; Write-Host \"Board set to passive/listen-only.\""
+      ],
+      "isBackground": false,
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "can-mode-active",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$ErrorActionPreference='Stop'; $board='${input:boardIp}'; Invoke-RestMethod -Uri \"http://$board/api/can/mode\" -Method Post -ContentType 'text/plain' -Body 'active' | Write-Host; Write-Host \"Board set to active mode.\""
+      ],
+      "isBackground": false,
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "can-monitor-http",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\can-monitor.ps1",
+        "-BoardIp",
+        "${input:boardIp}",
+        "-Mode",
+        "live"
+      ],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "can-status-summary",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\can-monitor.ps1",
+        "-BoardIp",
+        "${input:boardIp}",
+        "-Mode",
+        "summary"
+      ],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "can-live-monitor",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\can-monitor.ps1",
+        "-BoardIp",
+        "${input:boardIp}",
+        "-Mode",
+        "live"
+      ],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
       "label": "menu",
       "type": "shell",
       "command": "py",
@@ -122,6 +222,14 @@
         "reveal": "always",
         "panel": "new"
       }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "boardIp",
+      "type": "promptString",
+      "description": "IP address of the ESP32 board for CAN HTTP monitor tasks",
+      "default": "192.168.1.50"
     }
   ]
 }
