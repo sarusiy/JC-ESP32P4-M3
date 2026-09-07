@@ -59,6 +59,15 @@
 #endif
 #define CAN_TEST_ID 0x100
 
+/* Simulator-only IDs modeling a vehicle's internal (non-diagnostic) CAN bus:
+ * unsolicited, always-broadcasting, proprietary encodings -- unlike the
+ * standardized OBD-II request/response pair above. Real vehicles broadcast
+ * this kind of data continuously too, but on manufacturer-specific IDs with
+ * manufacturer-specific encodings that differ per make/model; these exact
+ * IDs and byte layouts will NOT mean anything on a real car's bus. */
+#define CAN_ID_ENGINE_STATE 0x120
+#define CAN_ID_VEHICLE_STATE 0x180
+
 /* Simulated GPS UART wiring on JP1 (see Doc/GPS_SIMULATION_AND_INTEGRATION_REQUIREMENTS.md).
  * GPIO34/35 are free on the same header as the MCP2515 wiring above. The
  * Arduino simulator's SoftwareSerial TX is 5V logic and is stepped down to
@@ -76,12 +85,43 @@
 #define WIFI_MAX_TX_POWER_QDBM 40
 
 /* OBD-II (SAE J1979) scan-tool request/response IDs, matching the simulated
- * ECU in the ArdunioUsbBridgeToCan repo. */
+ * ECU in the ArdunioUsbBridgeToCan repo. OBD_RESPONSE_ID is kept as the
+ * primary/engine ECU's ID (used for Mode 01 PID matching, which only that
+ * ECU answers here); OBD_RESPONSE_ID_MIN/MAX cover the full ISO 15765-4
+ * physical response range (0x7E8-0x7EF, ECUs 1-8) for Mode 03/04, since a
+ * real car's functional broadcast request can draw replies from multiple
+ * modules (engine, transmission, ABS, ...), not just one. */
 #define OBD_REQUEST_ID 0x7DF
 #define OBD_RESPONSE_ID 0x7E8
+#define OBD_RESPONSE_ID_MIN 0x7E8
+#define OBD_RESPONSE_ID_MAX 0x7EF
 #define OBD_MODE_CURRENT_DATA 0x01
+#define OBD_MODE_REQUEST_DTC 0x03
+#define OBD_MODE_CLEAR_DTC 0x04
 #define OBD_QUERY_INTERVAL_MS 200
 #define OBD_RESPONSE_TIMEOUT_MS 500
+/* Window to collect DTC/clear responses from potentially several ECUs
+ * answering one functional broadcast request, not just the first reply. */
+#define OBD_MULTI_ECU_WINDOW_MS 800
+
+/* Private/test CAN ID (outside the standard OBD range) used to tell the
+ * ArdunioUsbBridgeToCan simulator to set a fault, normally in response to
+ * the "Simulate Fault" button in the phone app. Real OBD-II has no "set a
+ * DTC" mode, so this is a vendor-private extension, not part of SAE J1979. */
+#define FAULT_INJECT_CAN_ID 0x701
+#define FAULT_CODE_COUNT 5
+/* Aggregate cap across all responding ECUs and all frames of a multi-frame
+ * (ISO-TP) response each -- not "per CAN frame" like before. */
+#define DTC_MAX_ACTIVE 16
+
+/* ISO 15765-2 (ISO-TP) protocol control information (PCI) nibble values,
+ * used to reassemble a Mode 03 DTC-list response spanning more than one CAN
+ * frame (needed once a single ECU reports more than ~3 DTCs). */
+#define ISOTP_PCI_SF 0x0 /* Single Frame: whole message fits in one CAN frame */
+#define ISOTP_PCI_FF 0x1 /* First Frame: starts a multi-frame message */
+#define ISOTP_PCI_CF 0x2 /* Consecutive Frame: continuation of a First Frame */
+#define ISOTP_PCI_FC 0x3 /* Flow Control: receiver telling sender to continue */
+#define ISOTP_MAX_PAYLOAD 32 /* mode byte + up to 15 DTCs -- generous for one ECU */
 
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
@@ -104,6 +144,156 @@ typedef struct {
 } obd_state_t;
 
 static obd_state_t s_obd_state;
+/* Written from two tasks now: can_echo_task (passive decode of engine/vehicle/
+ * OBD broadcasts, and now also unsolicited internal-bus broadcasts) and
+ * obd_query_task (active-mode Mode 01 request/response), read from the HTTP
+ * handler task -- needs a lock like health_state_t/gps_state_t below. */
+static portMUX_TYPE s_obd_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    uint8_t count;
+    uint16_t codes[DTC_MAX_ACTIVE]; /* each packed as (byte_high << 8) | byte_low, SAE J2012 */
+} dtc_state_t;
+
+static dtc_state_t s_dtc_state;
+static portMUX_TYPE s_dtc_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_dtc_clear_requested;
+
+typedef struct {
+    uint16_t raw;
+    const char *description;
+} dtc_description_t;
+
+/* Generic (SAE J2012-standardized) powertrain DTCs -- these P0xxx codes mean
+ * the same thing on every manufacturer's vehicle, unlike P1xxx+/manufacturer-
+ * specific codes, which aren't publicly standardized and can't be looked up
+ * without that maker's own documentation (those still decode to a correct
+ * "P1xxx"-style string via dtc_code_to_string, just with no description
+ * here -- see dtc_lookup_description's "Unknown fault" fallback). Includes
+ * the 5 codes ArdunioUsbBridgeToCan's simulator can inject. */
+static const dtc_description_t DTC_DESCRIPTIONS[] = {
+    { 0x0100, "Mass or Volume Air Flow Circuit Malfunction" },
+    { 0x0101, "Mass or Volume Air Flow Circuit Range/Performance Problem" },
+    { 0x0102, "Mass or Volume Air Flow Circuit Low Input" },
+    { 0x0103, "Mass or Volume Air Flow Circuit High Input" },
+    { 0x0106, "Manifold Absolute Pressure/Barometric Pressure Circuit Range/Performance" },
+    { 0x0107, "Manifold Absolute Pressure/Barometric Pressure Circuit Low Input" },
+    { 0x0108, "Manifold Absolute Pressure/Barometric Pressure Circuit High Input" },
+    { 0x0110, "Intake Air Temperature Circuit Malfunction" },
+    { 0x0111, "Intake Air Temperature Circuit Range/Performance Problem" },
+    { 0x0112, "Intake Air Temperature Circuit Low Input" },
+    { 0x0113, "Intake Air Temperature Circuit High Input" },
+    { 0x0115, "Engine Coolant Temperature Circuit Malfunction" },
+    { 0x0116, "Engine Coolant Temperature Circuit Range/Performance Problem" },
+    { 0x0117, "Engine Coolant Temperature Circuit Low Input" },
+    { 0x0118, "Engine Coolant Temperature Circuit High Input" },
+    { 0x0120, "Throttle/Pedal Position Sensor A Circuit Malfunction" },
+    { 0x0121, "Throttle/Pedal Position Sensor A Circuit Range/Performance Problem" },
+    { 0x0122, "Throttle/Pedal Position Sensor A Circuit Low Input" },
+    { 0x0123, "Throttle/Pedal Position Sensor A Circuit High Input" },
+    { 0x0125, "Insufficient Coolant Temperature for Closed Loop Fuel Control" },
+    { 0x0128, "Coolant Thermostat (Below Regulating Temperature)" },
+    { 0x0130, "O2 Sensor Circuit Malfunction (Bank 1 Sensor 1)" },
+    { 0x0131, "O2 Sensor Circuit Low Voltage (Bank 1 Sensor 1)" },
+    { 0x0132, "O2 Sensor Circuit High Voltage (Bank 1 Sensor 1)" },
+    { 0x0133, "O2 Sensor Circuit Slow Response (Bank 1 Sensor 1)" },
+    { 0x0134, "O2 Sensor Circuit No Activity Detected (Bank 1 Sensor 1)" },
+    { 0x0135, "O2 Sensor Heater Circuit Malfunction (Bank 1 Sensor 1)" },
+    { 0x0136, "O2 Sensor Circuit Malfunction (Bank 1 Sensor 2)" },
+    { 0x0141, "O2 Sensor Heater Circuit Malfunction (Bank 1 Sensor 2)" },
+    { 0x0170, "Fuel Trim Malfunction (Bank 1)" },
+    { 0x0171, "System Too Lean (Bank 1)" },
+    { 0x0172, "System Too Rich (Bank 1)" },
+    { 0x0173, "Fuel Trim Malfunction (Bank 2)" },
+    { 0x0174, "System Too Lean (Bank 2)" },
+    { 0x0175, "System Too Rich (Bank 2)" },
+    { 0x0190, "Fuel Rail Pressure Sensor Circuit Malfunction" },
+    { 0x0201, "Injector Circuit Malfunction - Cylinder 1" },
+    { 0x0202, "Injector Circuit Malfunction - Cylinder 2" },
+    { 0x0203, "Injector Circuit Malfunction - Cylinder 3" },
+    { 0x0204, "Injector Circuit Malfunction - Cylinder 4" },
+    { 0x0217, "Engine Overtemperature Condition" },
+    { 0x0219, "Engine Overspeed Condition" },
+    { 0x0230, "Fuel Pump Primary Circuit Malfunction" },
+    { 0x0234, "Engine Overboost Condition" },
+    { 0x0300, "Random/Multiple Cylinder Misfire Detected" },
+    { 0x0301, "Cylinder 1 Misfire Detected" },
+    { 0x0302, "Cylinder 2 Misfire Detected" },
+    { 0x0303, "Cylinder 3 Misfire Detected" },
+    { 0x0304, "Cylinder 4 Misfire Detected" },
+    { 0x0305, "Cylinder 5 Misfire Detected" },
+    { 0x0306, "Cylinder 6 Misfire Detected" },
+    { 0x0325, "Knock Sensor 1 Circuit Malfunction" },
+    { 0x0335, "Crankshaft Position Sensor A Circuit Malfunction" },
+    { 0x0336, "Crankshaft Position Sensor A Circuit Range/Performance" },
+    { 0x0340, "Camshaft Position Sensor A Circuit Malfunction" },
+    { 0x0341, "Camshaft Position Sensor A Circuit Range/Performance" },
+    { 0x0351, "Ignition Coil A Primary/Secondary Circuit Malfunction" },
+    { 0x0352, "Ignition Coil B Primary/Secondary Circuit Malfunction" },
+    { 0x0401, "Exhaust Gas Recirculation Flow Insufficient Detected" },
+    { 0x0402, "Exhaust Gas Recirculation Flow Excessive Detected" },
+    { 0x0403, "Exhaust Gas Recirculation Circuit Malfunction" },
+    { 0x0410, "Secondary Air Injection System Malfunction" },
+    { 0x0420, "Catalyst System Efficiency Below Threshold (Bank 1)" },
+    { 0x0430, "Catalyst System Efficiency Below Threshold (Bank 2)" },
+    { 0x0440, "Evaporative Emission Control System Malfunction" },
+    { 0x0441, "Evaporative Emission Control System Incorrect Purge Flow" },
+    { 0x0442, "EVAP Emission Control System Leak Detected (small leak)" },
+    { 0x0443, "Evaporative Emission Control System Purge Control Valve Circuit Malfunction" },
+    { 0x0446, "Evaporative Emission Control System Vent Control Circuit Malfunction" },
+    { 0x0455, "Evaporative Emission Control System Leak Detected (Large Leak)" },
+    { 0x0456, "Evaporative Emission Control System Leak Detected (Very Small Leak)" },
+    { 0x0460, "Fuel Level Sensor Circuit Malfunction" },
+    { 0x0480, "Cooling Fan 1 Control Circuit Malfunction" },
+    { 0x0500, "Vehicle Speed Sensor Malfunction" },
+    { 0x0505, "Idle Control System Malfunction" },
+    { 0x0506, "Idle Control System RPM Lower Than Expected" },
+    { 0x0507, "Idle Control System RPM Higher Than Expected" },
+    { 0x0520, "Engine Oil Pressure Sensor/Switch Circuit Malfunction" },
+    { 0x0562, "System Voltage Low" },
+    { 0x0563, "System Voltage High" },
+    { 0x0600, "Serial Communication Link Malfunction" },
+    { 0x0601, "Internal Control Module Memory Check Sum Error" },
+    { 0x0605, "Internal Control Module Read Only Memory (ROM) Error" },
+    { 0x0620, "Generator Control Circuit Malfunction" },
+    { 0x0630, "VIN Not Programmed or Incompatible - ECM" },
+    { 0x0700, "Transmission Control System Malfunction (MIL Request)" },
+    { 0x0701, "Transmission Control System Range/Performance" },
+    { 0x0705, "Transmission Range Sensor Circuit Malfunction" },
+    { 0x0706, "Transmission Range Sensor Circuit Range/Performance" },
+    { 0x0710, "Transmission Fluid Temperature Sensor Circuit Malfunction" },
+    { 0x0715, "Input/Turbine Speed Sensor Circuit Malfunction" },
+    { 0x0720, "Output Speed Sensor Circuit Malfunction" },
+    { 0x0730, "Incorrect Gear Ratio" },
+    { 0x0740, "Torque Converter Clutch Circuit Malfunction" },
+    { 0x0750, "Shift Solenoid A Malfunction" },
+    { 0x0755, "Shift Solenoid B Malfunction" },
+    { 0x0760, "Shift Solenoid C Malfunction" },
+};
+
+/* Decodes a raw 2-byte DTC per SAE J2012 into a "P0301"-style string. */
+static void dtc_code_to_string(uint16_t raw, char *out, size_t out_len)
+{
+    static const char categories[4] = { 'P', 'C', 'B', 'U' };
+    uint8_t hi = (raw >> 8) & 0xFF;
+    uint8_t lo = raw & 0xFF;
+    char category = categories[(hi >> 6) & 0x03];
+    uint8_t digit1 = (hi >> 4) & 0x03;
+    uint8_t digit2 = hi & 0x0F;
+    uint8_t digit3 = (lo >> 4) & 0x0F;
+    uint8_t digit4 = lo & 0x0F;
+    snprintf(out, out_len, "%c%01X%01X%01X%01X", category, digit1, digit2, digit3, digit4);
+}
+
+static const char *dtc_lookup_description(uint16_t raw)
+{
+    for (size_t i = 0; i < sizeof(DTC_DESCRIPTIONS) / sizeof(DTC_DESCRIPTIONS[0]); i++) {
+        if (DTC_DESCRIPTIONS[i].raw == raw) {
+            return DTC_DESCRIPTIONS[i].description;
+        }
+    }
+    return "Unknown fault";
+}
 
 typedef struct {
     uint32_t idle0_pct;
@@ -146,6 +336,7 @@ static portMUX_TYPE s_gps_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_gps_log_us;
 
 typedef struct {
+    uint32_t id;  /* source CAN ID: which ECU (0x7E8-0x7EF) this response came from */
     uint8_t dlc;
     uint8_t data[8];
 } obd_frame_t;
@@ -158,9 +349,18 @@ typedef struct {
     uint8_t data[8];
 } can_capture_frame_t;
 
-#define CAN_CAPTURE_CAPACITY 256
-#define CAN_CAPTURE_HTTP_BATCH 32
-#define CAN_CAPTURE_RESPONSE_SIZE 8192
+/* Sized for a real, busy vehicle CAN bus, not just this simulator's quiet
+ * two-node bus -- a real powertrain bus can run into the hundreds/low
+ * thousands of frames/sec across many ECUs. CAN_CAPTURE_CAPACITY is the ring
+ * buffer's total burst-absorption headroom (4096 * ~32 bytes/frame = ~128KB,
+ * trivial against this board's SRAM budget); CAN_CAPTURE_HTTP_BATCH bounds
+ * both how many frames can be drained per can_echo_task wake-up and how many
+ * one GET /api/can response returns, so raising it also raises the
+ * sustained drain rate the phone app can keep up with (at its ~100ms poll
+ * interval, 128/poll ~= 1280 frames/sec sustained, vs. 320/sec before). */
+#define CAN_CAPTURE_CAPACITY 4096
+#define CAN_CAPTURE_HTTP_BATCH 128
+#define CAN_CAPTURE_RESPONSE_SIZE 24576
 #define TASKS_RESPONSE_SIZE 8192
 
 static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
@@ -168,6 +368,14 @@ static uint64_t s_can_capture_sequence;
 static portMUX_TYPE s_can_capture_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_can_rx_task;
 static volatile bool s_can_passive = true;
+
+/* True only for the brief window between sending a Mode 01/03/04 request and
+ * receiving/timing out its reply. The Arduino simulator also broadcasts PID
+ * data unsolicited every 250ms regardless of mode; without this flag every
+ * such broadcast arriving between polls would get misrouted into
+ * s_obd_response_queue as if it were the answer to our last request,
+ * desyncing every request after it (see can_echo_task below). */
+static volatile bool s_obd_request_pending;
 
 /* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
 static QueueHandle_t s_obd_response_queue;
@@ -296,6 +504,8 @@ static void init_led(void)
  * request/response path (obd_query_task) and the passive-mode broadcast
  * capture path (can_echo_task) so a single decoder feeds s_obd_state either way. */
 static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len);
+static void decode_engine_broadcast(const uint8_t *data, uint8_t dlc);
+static void decode_vehicle_broadcast(const uint8_t *data, uint8_t dlc);
 
 /* Phase 1 echo test frames get echoed back; OBD-II responses get routed to
  * obd_query_task via a queue instead of being echoed. Single task owns the
@@ -311,6 +521,8 @@ static void can_echo_task(void *arg)
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) == 0) {
             s_can_timeout_count++;
         }
+        /* Once per wake-up, not once per frame -- see mcp2515_check_overflow. */
+        mcp2515_check_overflow();
         /* Drain both hardware RX buffers before sleeping; otherwise a second
          * frame arriving while the first is still pending gets left behind
          * and can overflow/reorder under back-to-back multi-frame traffic.
@@ -324,7 +536,7 @@ static void can_echo_task(void *arg)
         while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, &dlc, data)) {
             drained++;
             capture_can_frame(id, dlc, data);
-            if (id == OBD_RESPONSE_ID) {
+            if (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) {
                 if (s_can_passive) {
                     /* Passive mode never sends the 0x7DF request itself, but if the
                      * bus carries unsolicited OBD-II broadcasts (e.g. a simulated ECU
@@ -335,13 +547,31 @@ static void can_echo_task(void *arg)
                     if (dlc >= 3 && data[1] == (uint8_t)(0x40 | OBD_MODE_CURRENT_DATA)) {
                         obd_print_response(data[2], data, dlc);
                     }
-                } else {
-                    obd_frame_t frame = { .dlc = dlc };
+                } else if (s_obd_request_pending) {
+                    obd_frame_t frame = { .id = id, .dlc = dlc };
                     memcpy(frame.data, data, sizeof(frame.data));
                     if (xQueueSend(s_obd_response_queue, &frame, 0) != pdPASS) {
                         ESP_LOGW(TAG, "OBD response queue full; dropping response");
                     }
+                } else if (dlc >= 3 && data[1] == (uint8_t)(0x40 | OBD_MODE_CURRENT_DATA)) {
+                    /* Active mode, but no request currently in flight: one of the
+                     * ECU's own unsolicited periodic broadcasts landing between our
+                     * polls. Decode it passively instead of leaving it to rot in
+                     * the (already-empty) response queue. */
+                    obd_print_response(data[2], data, dlc);
                 }
+                continue;
+            }
+            /* Internal-bus-style broadcasts (see CAN_ID_ENGINE_STATE comment): always
+             * decoded regardless of s_can_passive, exactly like a real instrument
+             * cluster would -- this data isn't part of the diagnostic request/response
+             * protocol, so "passive" (never transmitting) has no bearing on receiving it. */
+            if (id == CAN_ID_ENGINE_STATE) {
+                decode_engine_broadcast(data, dlc);
+                continue;
+            }
+            if (id == CAN_ID_VEHICLE_STATE) {
+                decode_vehicle_broadcast(data, dlc);
                 continue;
             }
             if (!s_can_passive && id == CAN_TEST_ID) {
@@ -361,41 +591,291 @@ static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
     switch (pid) {
         case 0x00:
             if (len >= 7) {
-                s_obd_state.supported_pids = ((uint32_t)buf[3] << 24) |
-                                              ((uint32_t)buf[4] << 16) |
-                                              ((uint32_t)buf[5] << 8) | buf[6];
+                uint32_t bitmask = ((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16) |
+                                    ((uint32_t)buf[5] << 8) | buf[6];
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.supported_pids = bitmask;
+                portEXIT_CRITICAL(&s_obd_lock);
                 ESP_LOGI(TAG, "OBD PID 0x00 (supported PIDs)   -> bitmask %02x %02x %02x %02x",
                          buf[3], buf[4], buf[5], buf[6]);
             }
             break;
         case 0x05:
             if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
                 s_obd_state.coolant_c = buf[3] - 40;
+                portEXIT_CRITICAL(&s_obd_lock);
                 ESP_LOGI(TAG, "OBD PID 0x05 (coolant temp)      -> %d C", buf[3] - 40);
             }
             break;
         case 0x0C:
             if (len >= 5) {
+                portENTER_CRITICAL(&s_obd_lock);
                 s_obd_state.rpm = ((unsigned)buf[3] * 256 + buf[4]) / 4;
+                portEXIT_CRITICAL(&s_obd_lock);
                 ESP_LOGI(TAG, "OBD PID 0x0C (engine RPM)        -> %u rpm",
                          ((unsigned)buf[3] * 256 + buf[4]) / 4);
             }
             break;
         case 0x0D:
             if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
                 s_obd_state.speed_kmh = buf[3];
+                portEXIT_CRITICAL(&s_obd_lock);
                 ESP_LOGI(TAG, "OBD PID 0x0D (vehicle speed)     -> %u km/h", buf[3]);
             }
             break;
         case 0x11:
             if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
                 s_obd_state.throttle_pct = (buf[3] * 100u) / 255u;
+                portEXIT_CRITICAL(&s_obd_lock);
                 ESP_LOGI(TAG, "OBD PID 0x11 (throttle position) -> %u %%", (buf[3] * 100u) / 255u);
             }
             break;
         default:
             ESP_LOGI(TAG, "OBD PID 0x%02x -> unrecognized response", pid);
             break;
+    }
+}
+
+/* Decodes the simulator's engine-state broadcast (0x120, unsolicited, every
+ * 20ms regardless of CAN bridge mode) into the same live state Mode 01
+ * PID 0x0C/0x05/0x11 would report -- models a vehicle's internal bus, where
+ * this kind of data is always flowing whether or not a diagnostic tool is
+ * plugged in and asking. NOT a real vehicle's actual encoding; see the
+ * CAN_ID_ENGINE_STATE comment above. */
+static void decode_engine_broadcast(const uint8_t *data, uint8_t dlc)
+{
+    if (dlc < 4) {
+        return;
+    }
+    uint16_t rpm_raw = ((uint16_t)data[0] << 8) | data[1];
+    int coolant_c = (int)data[2] - 40;
+    uint8_t throttle_pct = (uint8_t)((uint16_t)data[3] * 100u / 255u);
+
+    portENTER_CRITICAL(&s_obd_lock);
+    s_obd_state.rpm = rpm_raw / 4;
+    s_obd_state.coolant_c = coolant_c;
+    s_obd_state.throttle_pct = throttle_pct;
+    portEXIT_CRITICAL(&s_obd_lock);
+}
+
+/* Decodes the simulator's vehicle-state broadcast (0x180, unsolicited, every
+ * 50ms) the same way -- see decode_engine_broadcast above. */
+static void decode_vehicle_broadcast(const uint8_t *data, uint8_t dlc)
+{
+    if (dlc < 2) {
+        return;
+    }
+    uint16_t speed_centi_kmh = ((uint16_t)data[0] << 8) | data[1];
+
+    portENTER_CRITICAL(&s_obd_lock);
+    s_obd_state.speed_kmh = (uint8_t)(speed_centi_kmh / 100);
+    portEXIT_CRITICAL(&s_obd_lock);
+}
+
+/* Reassembles one ISO-TP (ISO 15765-2) message starting from an already-
+ * dequeued frame that begins it: either a complete Single Frame, or a First
+ * Frame that needs Consecutive Frames collected after sending Flow Control.
+ * Needed once a single ECU's DTC list has more than ~3 codes and no longer
+ * fits in one CAN frame. Writes the reassembled payload (mode byte onward,
+ * ISO-TP framing stripped) into out_payload (caller-sized ISOTP_MAX_PAYLOAD)
+ * and *out_len. Returns true if at least some payload was assembled -- a
+ * message truncated by a dropped/out-of-order frame still returns whatever
+ * was received rather than nothing, so callers can use the partial data. */
+static bool isotp_reassemble(uint32_t response_id, const obd_frame_t *first,
+                              uint8_t *out_payload, uint8_t *out_len, int64_t deadline_us)
+{
+    if (first->dlc < 1) {
+        return false;
+    }
+    uint8_t pci = (first->data[0] >> 4) & 0x0F;
+
+    if (pci == ISOTP_PCI_SF) {
+        uint8_t sf_len = first->data[0] & 0x0F;
+        if (sf_len > 7) {
+            sf_len = 7;
+        }
+        if (sf_len > ISOTP_MAX_PAYLOAD) {
+            sf_len = ISOTP_MAX_PAYLOAD;
+        }
+        memcpy(out_payload, &first->data[1], sf_len);
+        *out_len = sf_len;
+        return true;
+    }
+
+    if (pci != ISOTP_PCI_FF) {
+        return false; /* stray Consecutive/Flow-Control frame with no First Frame -- ignore */
+    }
+
+    uint16_t total_len = ((uint16_t)(first->data[0] & 0x0F) << 8) | first->data[1];
+    if (total_len > ISOTP_MAX_PAYLOAD) {
+        total_len = ISOTP_MAX_PAYLOAD; /* clamp: still decode as many DTCs as fit */
+    }
+    uint8_t received = (total_len < 6) ? total_len : 6;
+    memcpy(out_payload, &first->data[2], received);
+
+    /* Flow Control: Continue-To-Send, block size 0 (send all remaining CFs
+     * without waiting for further FC), separation time 0. Sent to this ECU's
+     * physical request ID -- ISO 15765-4 fixes request/response as pairs
+     * 0x7E0<->0x7E8, 0x7E1<->0x7E9, ... 0x7E7<->0x7EF, i.e. response_id - 8. */
+    uint8_t fc[8] = { 0x30, 0x00, 0x00, 0, 0, 0, 0, 0 };
+    mcp2515_send(response_id - 8, sizeof(fc), fc);
+
+    uint8_t expected_seq = 1;
+    while (received < total_len) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        obd_frame_t frame;
+        if (!xQueueReceive(s_obd_response_queue, &frame, pdMS_TO_TICKS(remaining_ms))) {
+            break;
+        }
+        if (frame.id != response_id || frame.dlc < 1) {
+            continue; /* a different ECU's frame interleaved -- not this stream */
+        }
+        uint8_t frame_pci = (frame.data[0] >> 4) & 0x0F;
+        if (frame_pci != ISOTP_PCI_CF || (frame.data[0] & 0x0F) != (expected_seq & 0x0F)) {
+            continue; /* out-of-order/unexpected -- keep waiting within the deadline */
+        }
+        uint8_t chunk = total_len - received;
+        if (chunk > 7) {
+            chunk = 7;
+        }
+        memcpy(out_payload + received, &frame.data[1], chunk);
+        received += chunk;
+        expected_seq++;
+    }
+
+    *out_len = received;
+    return received > 0;
+}
+
+/* Appends any DTCs found in a decoded Mode 03 payload (payload[0]=0x43,
+ * payload[1..]=DTC byte pairs) into *collected, skipping duplicates in case
+ * more than one ECU happens to report the same code. Returns true if this
+ * was actually a Mode 03 positive response (so callers can count it as one
+ * more responding ECU even if it reported zero DTCs). */
+static bool dtc_collect_from_payload(const uint8_t *payload, uint8_t len, dtc_state_t *collected)
+{
+    if (len < 1 || payload[0] != 0x43) {
+        return false;
+    }
+    uint8_t dtc_byte_count = len - 1;
+    uint8_t dtc_count = dtc_byte_count / 2;
+    for (uint8_t i = 0; i < dtc_count && collected->count < DTC_MAX_ACTIVE; i++) {
+        uint16_t code = ((uint16_t)payload[1 + i * 2] << 8) | payload[2 + i * 2];
+        bool duplicate = false;
+        for (uint8_t j = 0; j < collected->count; j++) {
+            if (collected->codes[j] == code) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            collected->codes[collected->count++] = code;
+        }
+    }
+    return true;
+}
+
+/* Sends Mode 04 (clear DTCs) as a functional broadcast and collects 0x44 acks
+ * from every ECU that answers within OBD_MULTI_ECU_WINDOW_MS, if the CAN
+ * bridge is active. Called from obd_query_task so it shares the single
+ * in-flight request/response slot with the rest of the OBD scan -- never
+ * races the PID or DTC-scan requests below for s_obd_response_queue. */
+static void obd_query_clear_dtcs_if_requested(void)
+{
+    if (!s_dtc_clear_requested) {
+        return;
+    }
+    s_dtc_clear_requested = false;
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "DTC clear requested while CAN bridge is passive; ignored");
+        return;
+    }
+
+    uint8_t request[8] = { 0x01, OBD_MODE_CLEAR_DTC, 0, 0, 0, 0, 0, 0 };
+    s_obd_request_pending = true;
+    mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+
+    uint8_t acks = 0;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_MULTI_ECU_WINDOW_MS * 1000);
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        obd_frame_t response;
+        if (!xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(remaining_ms))) {
+            break;
+        }
+        if (response.dlc >= 2 && response.data[1] == 0x44) {
+            acks++;
+        }
+    }
+    s_obd_request_pending = false;
+
+    if (acks > 0) {
+        portENTER_CRITICAL(&s_dtc_lock);
+        s_dtc_state.count = 0;
+        portEXIT_CRITICAL(&s_dtc_lock);
+        ESP_LOGI(TAG, "DTC clear -> acknowledged by %u ECU(s), all faults cleared", acks);
+    } else {
+        ESP_LOGW(TAG, "DTC clear -> no response (timeout)");
+    }
+}
+
+/* Sends Mode 03 (request DTCs) as a functional broadcast and collects
+ * responses -- potentially multi-frame, potentially from several ECUs -- from
+ * everyone who answers within OBD_MULTI_ECU_WINDOW_MS. Same single-in-flight-
+ * request rule as obd_query_clear_dtcs_if_requested above. */
+static void obd_query_dtcs(void)
+{
+    if (s_can_passive) {
+        return;
+    }
+
+    uint8_t request[8] = { 0x01, OBD_MODE_REQUEST_DTC, 0, 0, 0, 0, 0, 0 };
+    s_obd_request_pending = true;
+    mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+
+    dtc_state_t collected = { 0 };
+    uint8_t responding_ecus = 0;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_MULTI_ECU_WINDOW_MS * 1000);
+
+    while (esp_timer_get_time() < deadline_us && collected.count < DTC_MAX_ACTIVE) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        obd_frame_t response;
+        if (!xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(remaining_ms))) {
+            break;
+        }
+
+        uint8_t payload[ISOTP_MAX_PAYLOAD];
+        uint8_t payload_len = 0;
+        if (isotp_reassemble(response.id, &response, payload, &payload_len, deadline_us) &&
+            dtc_collect_from_payload(payload, payload_len, &collected)) {
+            responding_ecus++;
+        }
+    }
+    s_obd_request_pending = false;
+
+    portENTER_CRITICAL(&s_dtc_lock);
+    s_dtc_state = collected;
+    portEXIT_CRITICAL(&s_dtc_lock);
+
+    if (collected.count > 0) {
+        ESP_LOGI(TAG, "DTC scan -> %u active fault(s) across %u ECU(s)", collected.count, responding_ecus);
+    } else if (responding_ecus > 0) {
+        ESP_LOGI(TAG, "DTC scan -> %u ECU(s) responded, no active faults", responding_ecus);
+    } else {
+        ESP_LOGI(TAG, "DTC scan -> no response (timeout)");
     }
 }
 
@@ -407,6 +887,8 @@ static void obd_query_task(void *arg)
     static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11 };
 
     while (1) {
+        obd_query_clear_dtcs_if_requested();
+
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
             if (s_can_passive) {
                 vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
@@ -414,10 +896,12 @@ static void obd_query_task(void *arg)
             }
 
             uint8_t request[8] = { 0x02, OBD_MODE_CURRENT_DATA, pids[i], 0, 0, 0, 0, 0 };
+            s_obd_request_pending = true;
             mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
 
             obd_frame_t response;
             bool got = xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+            s_obd_request_pending = false;
             if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
                 obd_print_response(pids[i], response.data, response.dlc);
             } else if (got) {
@@ -430,6 +914,9 @@ static void obd_query_task(void *arg)
 
             vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
         }
+
+        obd_query_dtcs();
+        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
     }
 }
 
@@ -448,7 +935,10 @@ static void start_can_bridge(void)
     }
     s_can_passive = true;
 
-    s_obd_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
+    /* 16, not 4: a multi-frame DTC response from several ECUs can legitimately
+     * queue up many frames in a burst (First Frame + several Consecutive
+     * Frames, times however many ECUs answer) -- see obd_query_dtcs. */
+    s_obd_response_queue = xQueueCreate(16, sizeof(obd_frame_t));
     if (s_obd_response_queue == NULL) {
         ESP_LOGE(TAG, "CAN bridge queue allocation failed");
         return;
@@ -939,7 +1429,10 @@ static esp_err_t frequency_http_handler(httpd_req_t *request)
 
 static esp_err_t obd_http_handler(httpd_req_t *request)
 {
-    obd_state_t state = s_obd_state;
+    obd_state_t state;
+    portENTER_CRITICAL(&s_obd_lock);
+    state = s_obd_state;
+    portEXIT_CRITICAL(&s_obd_lock);
     char response[192];
     snprintf(response, sizeof(response),
              "{\"supported_pids\":\"%08lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
@@ -947,6 +1440,73 @@ static esp_err_t obd_http_handler(httpd_req_t *request)
              state.rpm, state.speed_kmh, state.throttle_pct);
     httpd_resp_set_type(request, "application/json");
     httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+static esp_err_t dtc_http_handler(httpd_req_t *request)
+{
+    dtc_state_t state;
+    portENTER_CRITICAL(&s_dtc_lock);
+    state = s_dtc_state;
+    portEXIT_CRITICAL(&s_dtc_lock);
+
+    /* Sized for up to DTC_MAX_ACTIVE=16 entries, longest description ~80 chars:
+     * 16 * ~110 + overhead comfortably fits 2048. */
+    char response[2048];
+    int written = snprintf(response, sizeof(response), "{\"count\":%u,\"codes\":[", state.count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < state.count && used < sizeof(response); i++) {
+        char code_str[6];
+        dtc_code_to_string(state.codes[i], code_str, sizeof(code_str));
+        written = snprintf(response + used, sizeof(response) - used,
+                            "%s{\"code\":\"%s\",\"description\":\"%s\"}",
+                            i == 0 ? "" : ",", code_str, dtc_lookup_description(state.codes[i]));
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Actual clearing happens in obd_query_task (obd_query_clear_dtcs_if_requested),
+ * which owns the single in-flight OBD request/response slot; this handler
+ * just raises the request flag and returns immediately. */
+static esp_err_t dtc_clear_http_handler(httpd_req_t *request)
+{
+    s_dtc_clear_requested = true;
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"clear requested\"}");
+    return ESP_OK;
+}
+
+/* Sends the private fault-injection CAN frame straight from this HTTP
+ * handler's own task (mcp2515_send is SPI-mutex protected, so this is safe
+ * to call concurrently with obd_query_task/can_echo_task) rather than
+ * routing through the OBD request/response slot -- there is no response to
+ * wait for on this private channel. */
+static esp_err_t dtc_simulate_http_handler(httpd_req_t *request)
+{
+    char body[8] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    long index = 0;
+    if (received > 0) {
+        body[received] = '\0';
+        index = strtol(body, NULL, 10);
+    }
+    if (index < 0 || index >= FAULT_CODE_COUNT) {
+        index = 0;
+    }
+
+    uint8_t payload = (uint8_t)index;
+    mcp2515_send(FAULT_INJECT_CAN_ID, 1, &payload);
+    ESP_LOGI(TAG, "Fault simulate: requested index=%ld", index);
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"fault injection requested\"}");
     return ESP_OK;
 }
 
@@ -1167,6 +1727,17 @@ static void start_frequency_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    /* Default max_uri_handlers is 8; we now register 10 (frequency, obd,
+     * can_capture, can_mode, gps, health, tasks, dtc, dtc_clear, dtc_simulate).
+     * Without raising this, registrations past the 8th silently fail
+     * (ESP_ERR_HTTPD_HANDLERS_FULL) instead of crashing, which is a much
+     * harder bug to notice -- endpoints just 404. */
+    config.max_uri_handlers = 12;
+    /* Default stack_size is 4096. can_capture_http_handler's local
+     * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
+     * the entire default stack, with nothing left for anything else in that
+     * handler (or any other handler sharing this same httpd task). */
+    config.stack_size = 10240;
     httpd_uri_t frequency_uri = {
         .uri = "/api/frequency",
         .method = HTTP_POST,
@@ -1202,6 +1773,21 @@ static void start_frequency_http_server(void)
         .method = HTTP_GET,
         .handler = tasks_http_handler,
     };
+    httpd_uri_t dtc_uri = {
+        .uri = "/api/dtc",
+        .method = HTTP_GET,
+        .handler = dtc_http_handler,
+    };
+    httpd_uri_t dtc_clear_uri = {
+        .uri = "/api/dtc/clear",
+        .method = HTTP_POST,
+        .handler = dtc_clear_http_handler,
+    };
+    httpd_uri_t dtc_simulate_uri = {
+        .uri = "/api/dtc/simulate",
+        .method = HTTP_POST,
+        .handler = dtc_simulate_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -1210,6 +1796,9 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &can_mode_uri);
         httpd_register_uri_handler(http_server, &gps_uri);
         httpd_register_uri_handler(http_server, &health_uri);
+        httpd_register_uri_handler(http_server, &dtc_uri);
+        httpd_register_uri_handler(http_server, &dtc_clear_uri);
+        httpd_register_uri_handler(http_server, &dtc_simulate_uri);
         httpd_register_uri_handler(http_server, &tasks_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
@@ -1218,6 +1807,7 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "GPS API ready: GET /api/gps");
         ESP_LOGI(TAG, "Health API ready: GET /api/health");
         ESP_LOGI(TAG, "Tasks API ready: GET /api/tasks");
+        ESP_LOGI(TAG, "DTC API ready: GET /api/dtc, POST /api/dtc/clear, POST /api/dtc/simulate");
     }
 }
 
