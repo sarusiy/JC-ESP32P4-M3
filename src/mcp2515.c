@@ -47,9 +47,15 @@ static const char *TAG = "mcp2515";
 #define CNF2_500KBPS_8MHZ 0x90
 #define CNF3_500KBPS_8MHZ 0x02
 
-/* Conservative bit-bang half-period; well under the 1 MHz cap the trial
- * wiring doc (direct 3.3V GPIO to a 5V-powered module) recommends. */
-#define BITBANG_HALF_PERIOD_US 2
+/* Bit-bang half-period. The trial wiring doc (direct 3.3V GPIO to a 5V-
+ * powered module) documented 1 MHz as a safe cap; this was originally set to
+ * 2us (250 kHz, 4x under that cap) purely as an untested starting point, not
+ * because 250 kHz was ever shown to be a real ceiling. Tightened to 1us
+ * (500 kHz, still 2x margin under the documented-safe cap) once load testing
+ * showed the MCP2515's 2 receive buffers overflowing under real-car-scale
+ * traffic (~750 fps) -- each bit-banged byte transfer is the dominant per-
+ * frame cost, so halving it materially raises the chip-level receive rate. */
+#define BITBANG_HALF_PERIOD_US 1
 
 static int s_sck_gpio;
 static int s_mosi_gpio;
@@ -199,17 +205,27 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config)
     return ESP_OK;
 }
 
-bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
+/* Checking REG_EFLG is a full extra SPI transaction (~100us bit-banged) on
+ * top of the actual receive -- fine at frame-scan-rate polling, but a real
+ * cost when called once per frame under sustained high traffic (which is
+ * most of the time, since overflow is the rare case). Split out so callers
+ * can check it periodically (e.g. once per can_echo_task wake-up) instead
+ * of once per mcp2515_receive() call. */
+void mcp2515_check_overflow(void)
 {
     uint8_t overflow_flags = mcp2515_read_reg(REG_EFLG) & (EFLG_RX0OVR | EFLG_RX1OVR);
-    if (overflow_flags != 0) {
-        portENTER_CRITICAL(&s_overflow_lock);
-        s_receive_overflow_count += (overflow_flags & EFLG_RX0OVR ? 1 : 0) +
-                                    (overflow_flags & EFLG_RX1OVR ? 1 : 0);
-        portEXIT_CRITICAL(&s_overflow_lock);
-        mcp2515_bit_modify(REG_EFLG, overflow_flags, 0);
+    if (overflow_flags == 0) {
+        return;
     }
+    portENTER_CRITICAL(&s_overflow_lock);
+    s_receive_overflow_count += (overflow_flags & EFLG_RX0OVR ? 1 : 0) +
+                                (overflow_flags & EFLG_RX1OVR ? 1 : 0);
+    portEXIT_CRITICAL(&s_overflow_lock);
+    mcp2515_bit_modify(REG_EFLG, overflow_flags, 0);
+}
 
+bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
+{
     uint8_t status = mcp2515_read_status();
     bool rxb0_pending = status & 0x01;
     bool rxb1_pending = status & 0x02;

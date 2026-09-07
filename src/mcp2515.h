@@ -25,8 +25,18 @@ typedef struct {
  * switched back to active mode. */
 esp_err_t mcp2515_init(const mcp2515_config_t *config);
 
-/* Non-blocking poll. Returns true and fills outputs if a frame was pending. */
+/* Non-blocking poll. Returns true and fills outputs if a frame was pending.
+ * Does NOT check/clear the overflow flag itself (see mcp2515_check_overflow)
+ * -- that used to happen on every call, which is a real cost under sustained
+ * high traffic since overflow is the rare case. Callers should call
+ * mcp2515_check_overflow() periodically (e.g. once per poll cycle), not once
+ * per received frame. */
 bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data);
+
+/* Checks REG_EFLG for RX buffer overflow and clears it if set, updating the
+ * counter returned by mcp2515_get_receive_overflow_count(). Call this
+ * periodically (once per poll cycle is plenty), not once per frame. */
+void mcp2515_check_overflow(void);
 
 /* Number of RX buffers that overflowed since initialization. */
 uint32_t mcp2515_get_receive_overflow_count(void);
