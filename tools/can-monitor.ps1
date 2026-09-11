@@ -1,5 +1,5 @@
 param(
-    [string]$BoardIp = '192.168.1.50',
+    [string]$BoardIp = '192.168.1.180',
     [ValidateSet('summary','live')]
     [string]$Mode = 'summary',
     [int]$PollSeconds = 1
