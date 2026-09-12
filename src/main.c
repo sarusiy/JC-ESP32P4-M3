@@ -95,6 +95,15 @@
 #define OBD_RESPONSE_ID 0x7E8
 #define OBD_RESPONSE_ID_MIN 0x7E8
 #define OBD_RESPONSE_ID_MAX 0x7EF
+
+/* Some vehicles (confirmed: Fiat 500, 2007-2015 "Type 312" platform) use
+ * 29-bit extended CAN IDs for OBD-II instead of the 11-bit scheme above --
+ * still classic CAN 2.0B (NOT CAN FD), just a longer identifier field. Every
+ * query is sent on BOTH schemes; whichever one the vehicle doesn't use
+ * simply times out unanswered, same as any other non-response. */
+#define OBD_REQUEST_ID_EXT 0x18DB33F1UL
+#define OBD_RESPONSE_ID_EXT_MIN 0x18DAF100UL
+#define OBD_RESPONSE_ID_EXT_MAX 0x18DAF1FFUL
 #define OBD_MODE_CURRENT_DATA 0x01
 #define OBD_MODE_REQUEST_DTC 0x03
 #define OBD_MODE_CLEAR_DTC 0x04
@@ -541,10 +550,12 @@ static void can_echo_task(void *arg)
          * starves this task's own 100ms notify cadence (and, on a real bus,
          * protects against any other pathologically busy traffic burst). */
         uint32_t drained = 0;
-        while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, &dlc, data)) {
+        while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, NULL, &dlc, data)) {
             drained++;
             capture_can_frame(id, dlc, data);
-            if (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) {
+            bool is_obd_response = (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) ||
+                                    (id >= OBD_RESPONSE_ID_EXT_MIN && id <= OBD_RESPONSE_ID_EXT_MAX);
+            if (is_obd_response) {
                 if (s_can_passive) {
                     /* Passive mode never sends the 0x7DF request itself, but if the
                      * bus carries unsolicited OBD-II broadcasts (e.g. a simulated ECU
@@ -585,7 +596,7 @@ static void can_echo_task(void *arg)
             if (!s_can_passive && id == CAN_TEST_ID) {
                 printf("CAN RX id=0x%03lx dlc=%d data='%.*s' -> echoing\n",
                        (unsigned long)id, dlc, dlc, data);
-                mcp2515_send(id, dlc, data);
+                mcp2515_send(id, false, dlc, data);
             }
         }
     }
@@ -726,10 +737,22 @@ static bool isotp_reassemble(uint32_t response_id, const obd_frame_t *first,
 
     /* Flow Control: Continue-To-Send, block size 0 (send all remaining CFs
      * without waiting for further FC), separation time 0. Sent to this ECU's
-     * physical request ID -- ISO 15765-4 fixes request/response as pairs
-     * 0x7E0<->0x7E8, 0x7E1<->0x7E9, ... 0x7E7<->0x7EF, i.e. response_id - 8. */
+     * physical request ID. Standard 11-bit: ISO 15765-4 fixes the pairs
+     * 0x7E0<->0x7E8 ... 0x7E7<->0x7EF, i.e. response_id - 8. Extended 29-bit
+     * (e.g. Fiat 500): physical addressing is 0x18DA<target><source>, so the
+     * response 0x18DAF111 (target=tester 0xF1, source=ECU 0x11) pairs with
+     * request 0x18DA11F1 -- swap the low two bytes instead of subtracting. */
+    bool response_is_extended = response_id > 0x7FF;
+    uint32_t request_id;
+    if (response_is_extended) {
+        uint8_t byte1 = (uint8_t)(response_id >> 8);
+        uint8_t byte0 = (uint8_t)response_id;
+        request_id = (response_id & 0xFFFF0000UL) | ((uint32_t)byte0 << 8) | byte1;
+    } else {
+        request_id = response_id - 8;
+    }
     uint8_t fc[8] = { 0x30, 0x00, 0x00, 0, 0, 0, 0, 0 };
-    mcp2515_send(response_id - 8, sizeof(fc), fc);
+    mcp2515_send(request_id, response_is_extended, sizeof(fc), fc);
 
     uint8_t expected_seq = 1;
     while (received < total_len) {
@@ -789,6 +812,17 @@ static bool dtc_collect_from_payload(const uint8_t *payload, uint8_t len, dtc_st
     return true;
 }
 
+/* Sends one OBD request on both the standard (0x7DF) and extended
+ * (0x18DB33F1) functional IDs, since we don't know in advance which
+ * addressing scheme a given vehicle uses -- see OBD_REQUEST_ID_EXT comment.
+ * The scheme the vehicle doesn't use simply goes unanswered, same as any
+ * other timeout; can_echo_task recognizes responses from either range. */
+static void obd_send_request(const uint8_t *request, uint8_t len)
+{
+    mcp2515_send(OBD_REQUEST_ID, false, len, request);
+    mcp2515_send(OBD_REQUEST_ID_EXT, true, len, request);
+}
+
 /* Sends Mode 04 (clear DTCs) as a functional broadcast and collects 0x44 acks
  * from every ECU that answers within OBD_MULTI_ECU_WINDOW_MS, if the CAN
  * bridge is active. Called from obd_query_task so it shares the single
@@ -808,7 +842,7 @@ static void obd_query_clear_dtcs_if_requested(void)
 
     uint8_t request[8] = { 0x01, OBD_MODE_CLEAR_DTC, 0, 0, 0, 0, 0, 0 };
     s_obd_request_pending = true;
-    mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+    obd_send_request(request, sizeof(request));
 
     uint8_t acks = 0;
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_MULTI_ECU_WINDOW_MS * 1000);
@@ -849,7 +883,7 @@ static void obd_query_dtcs(void)
 
     uint8_t request[8] = { 0x01, OBD_MODE_REQUEST_DTC, 0, 0, 0, 0, 0, 0 };
     s_obd_request_pending = true;
-    mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+    obd_send_request(request, sizeof(request));
 
     dtc_state_t collected = { 0 };
     uint8_t responding_ecus = 0;
@@ -905,7 +939,7 @@ static void obd_query_task(void *arg)
 
             uint8_t request[8] = { 0x02, OBD_MODE_CURRENT_DATA, pids[i], 0, 0, 0, 0, 0 };
             s_obd_request_pending = true;
-            mcp2515_send(OBD_REQUEST_ID, sizeof(request), request);
+            obd_send_request(request, sizeof(request));
 
             obd_frame_t response;
             bool got = xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
@@ -1517,7 +1551,7 @@ static esp_err_t dtc_simulate_http_handler(httpd_req_t *request)
     }
 
     uint8_t payload = (uint8_t)index;
-    mcp2515_send(FAULT_INJECT_CAN_ID, 1, &payload);
+    mcp2515_send(FAULT_INJECT_CAN_ID, false, 1, &payload);
     ESP_LOGI(TAG, "Fault simulate: requested index=%ld", index);
 
     httpd_resp_set_type(request, "application/json");

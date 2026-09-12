@@ -224,7 +224,7 @@ void mcp2515_check_overflow(void)
     mcp2515_bit_modify(REG_EFLG, overflow_flags, 0);
 }
 
-bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
+bool mcp2515_receive(uint32_t *id, bool *extended, uint8_t *dlc, uint8_t *data)
 {
     uint8_t status = mcp2515_read_status();
     bool rxb0_pending = status & 0x01;
@@ -251,12 +251,25 @@ bool mcp2515_receive(uint32_t *id, uint8_t *dlc, uint8_t *data)
 
     uint8_t sidh = rx[1];
     uint8_t sidl = rx[2];
+    uint8_t eid8 = rx[3];
+    uint8_t eid0 = rx[4];
     uint8_t dlc_byte = rx[5] & 0x0F;
     if (dlc_byte > 8) {
         dlc_byte = 8;
     }
 
-    *id = ((uint32_t)sidh << 3) | (sidl >> 5);
+    /* SIDL bit 3 (IDE) marks an extended frame; RXM=11 (receive-any, set at
+     * init) lets both standard and extended frames through unfiltered. */
+    bool is_extended = (sidl & 0x08) != 0;
+    if (is_extended) {
+        *id = ((uint32_t)sidh << 21) | (((uint32_t)(sidl & 0xE0)) << 13) |
+              (((uint32_t)(sidl & 0x03)) << 16) | ((uint32_t)eid8 << 8) | eid0;
+    } else {
+        *id = ((uint32_t)sidh << 3) | (sidl >> 5);
+    }
+    if (extended != NULL) {
+        *extended = is_extended;
+    }
     *dlc = dlc_byte;
     memcpy(data, &rx[6], dlc_byte);
     return true;
@@ -277,20 +290,36 @@ esp_err_t mcp2515_set_listen_only(bool enabled)
                : ESP_ERR_TIMEOUT;
 }
 
-esp_err_t mcp2515_send(uint32_t id, uint8_t dlc, const uint8_t *data)
+esp_err_t mcp2515_send(uint32_t id, bool extended, uint8_t dlc, const uint8_t *data)
 {
     if (dlc > 8) {
         dlc = 8;
+    }
+
+    uint8_t sidh, sidl, eid8, eid0;
+    if (extended) {
+        /* 29-bit id = SID(11 bits):EID(18 bits). EXIDE (SIDL bit 3) marks
+         * the frame as extended -- see mcp2515_receive() for the matching
+         * reconstruction on the RX side. */
+        sidh = (uint8_t)(id >> 21);
+        sidl = (uint8_t)(((id >> 13) & 0xE0) | 0x08 | ((id >> 16) & 0x03));
+        eid8 = (uint8_t)(id >> 8);
+        eid0 = (uint8_t)id;
+    } else {
+        sidh = (uint8_t)(id >> 3);
+        sidl = (uint8_t)((id & 0x07) << 5);
+        eid8 = 0x00;
+        eid0 = 0x00;
     }
 
     uint8_t tx[1 + 5 + 8] = {0};
     uint8_t idx = 0;
     tx[idx++] = MCP_WRITE;
     tx[idx++] = REG_TXB0SIDH;
-    tx[idx++] = (uint8_t)(id >> 3);
-    tx[idx++] = (uint8_t)((id & 0x07) << 5);
-    tx[idx++] = 0x00; /* EID8, unused (standard frame) */
-    tx[idx++] = 0x00; /* EID0, unused (standard frame) */
+    tx[idx++] = sidh;
+    tx[idx++] = sidl;
+    tx[idx++] = eid8;
+    tx[idx++] = eid0;
     tx[idx++] = dlc;
     memcpy(&tx[idx], data, dlc);
     idx += dlc;
