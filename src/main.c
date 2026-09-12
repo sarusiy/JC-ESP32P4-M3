@@ -104,6 +104,18 @@
 #define OBD_REQUEST_ID_EXT 0x18DB33F1UL
 #define OBD_RESPONSE_ID_EXT_MIN 0x18DAF100UL
 #define OBD_RESPONSE_ID_EXT_MAX 0x18DAF1FFUL
+
+/* Private CAN IDs (outside any real OBD-II range, mirrors FAULT_INJECT_CAN_ID
+ * below) understood only by the ArdunioUsbBridgeToCan bench simulator: lets
+ * this firmware tell whether it's talking to that simulator or a real
+ * vehicle, and lets the phone app remote-control which OBD-II addressing
+ * scheme the simulator currently answers on, to exercise real-tool-style
+ * detection logic on the bench against both schemes without needing two
+ * different real cars. */
+#define SIM_IDENTIFY_CAN_ID    0x702
+#define SIM_MODE_SWITCH_CAN_ID 0x703
+#define SIM_IDENTIFY_MAGIC     0xA5
+#define SIM_IDENTIFY_TIMEOUT_MS 250
 #define OBD_MODE_CURRENT_DATA 0x01
 #define OBD_MODE_REQUEST_DTC 0x03
 #define OBD_MODE_CLEAR_DTC 0x04
@@ -397,6 +409,42 @@ static volatile bool s_obd_request_pending;
 /* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
 static QueueHandle_t s_obd_response_queue;
 
+/* Which OBD-II addressing scheme has actually gotten a response so far.
+ * UNKNOWN means "haven't heard back on either scheme yet" -- obd_send_request
+ * probes both in that state; once one responds, every later query sticks to
+ * just that scheme (matching how a real scan tool detects-once-then-commits,
+ * instead of forever paying the cost of asking both ways). Reset to UNKNOWN
+ * after a run of consecutive timeouts (the vehicle/simulator may have
+ * changed) or right after a simulator mode-switch request. */
+typedef enum {
+    OBD_ADDR_UNKNOWN = 0,
+    OBD_ADDR_STANDARD,
+    OBD_ADDR_EXTENDED,
+} obd_addressing_t;
+static volatile obd_addressing_t s_obd_addressing = OBD_ADDR_UNKNOWN;
+static portMUX_TYPE s_obd_addressing_lock = portMUX_INITIALIZER_UNLOCKED;
+#define OBD_ADDR_RESET_AFTER_TIMEOUTS 5
+
+/* Combines "who's on the other end of the bus" with which scheme they use,
+ * for GET /api/can/partner. Determined by obd_identify_partner() pinging
+ * SIM_IDENTIFY_CAN_ID: a response means the bench simulator (which also
+ * reports its own current mode in the reply); no response, combined with
+ * whatever s_obd_addressing has locked onto from real OBD traffic, means an
+ * actual vehicle using that scheme (or UNKNOWN if neither has been seen). */
+typedef enum {
+    OBD_PARTNER_UNKNOWN = 0,
+    OBD_PARTNER_SIM_11,
+    OBD_PARTNER_SIM_29,
+    OBD_PARTNER_CAR_11,
+    OBD_PARTNER_CAR_29,
+} obd_partner_t;
+static volatile obd_partner_t s_obd_partner = OBD_PARTNER_UNKNOWN;
+static portMUX_TYPE s_obd_partner_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool s_identify_pending;
+static volatile uint8_t s_identify_response[2];
+static SemaphoreHandle_t s_identify_semaphore;
+
 static void capture_can_frame(uint32_t id, uint8_t dlc, const uint8_t *data)
 {
     int64_t timestamp_us = esp_timer_get_time();
@@ -553,9 +601,25 @@ static void can_echo_task(void *arg)
         while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, NULL, &dlc, data)) {
             drained++;
             capture_can_frame(id, dlc, data);
-            bool is_obd_response = (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) ||
-                                    (id >= OBD_RESPONSE_ID_EXT_MIN && id <= OBD_RESPONSE_ID_EXT_MAX);
+            if (id == SIM_IDENTIFY_CAN_ID) {
+                if (s_identify_pending && dlc >= 2) {
+                    s_identify_response[0] = data[0];
+                    s_identify_response[1] = data[1];
+                    xSemaphoreGive(s_identify_semaphore);
+                }
+                continue;
+            }
+            bool response_is_extended = (id >= OBD_RESPONSE_ID_EXT_MIN && id <= OBD_RESPONSE_ID_EXT_MAX);
+            bool is_obd_response = (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) || response_is_extended;
             if (is_obd_response) {
+                /* First real response locks in which scheme this vehicle uses,
+                 * same as a real scan tool committing after its initial probe --
+                 * see s_obd_addressing comment. */
+                portENTER_CRITICAL(&s_obd_addressing_lock);
+                if (s_obd_addressing == OBD_ADDR_UNKNOWN) {
+                    s_obd_addressing = response_is_extended ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
+                }
+                portEXIT_CRITICAL(&s_obd_addressing_lock);
                 if (s_can_passive) {
                     /* Passive mode never sends the 0x7DF request itself, but if the
                      * bus carries unsolicited OBD-II broadcasts (e.g. a simulated ECU
@@ -812,15 +876,78 @@ static bool dtc_collect_from_payload(const uint8_t *payload, uint8_t len, dtc_st
     return true;
 }
 
-/* Sends one OBD request on both the standard (0x7DF) and extended
- * (0x18DB33F1) functional IDs, since we don't know in advance which
- * addressing scheme a given vehicle uses -- see OBD_REQUEST_ID_EXT comment.
- * The scheme the vehicle doesn't use simply goes unanswered, same as any
- * other timeout; can_echo_task recognizes responses from either range. */
+/* Sends one OBD request. While s_obd_addressing is still UNKNOWN, probes
+ * both the standard (0x7DF) and extended (0x18DB33F1) functional IDs, since
+ * we don't know in advance which scheme a given vehicle uses -- see
+ * OBD_REQUEST_ID_EXT comment. Once can_echo_task has locked onto whichever
+ * scheme actually got a response, only that one is sent from then on,
+ * matching how a real scan tool detects once then commits instead of
+ * forever paying the cost of asking both ways. */
 static void obd_send_request(const uint8_t *request, uint8_t len)
 {
-    mcp2515_send(OBD_REQUEST_ID, false, len, request);
-    mcp2515_send(OBD_REQUEST_ID_EXT, true, len, request);
+    portENTER_CRITICAL(&s_obd_addressing_lock);
+    obd_addressing_t addressing = s_obd_addressing;
+    portEXIT_CRITICAL(&s_obd_addressing_lock);
+
+    if (addressing != OBD_ADDR_EXTENDED) {
+        mcp2515_send(OBD_REQUEST_ID, false, len, request);
+    }
+    if (addressing != OBD_ADDR_STANDARD) {
+        mcp2515_send(OBD_REQUEST_ID_EXT, true, len, request);
+    }
+}
+
+/* Pings the bench simulator's private identify ID and waits briefly for its
+ * reply, which also reports the simulator's own current addressing mode --
+ * see SIM_IDENTIFY_CAN_ID comment. A response means the simulator is on the
+ * bus (and directly tells us its mode, no need to separately probe/lock via
+ * real OBD traffic); no response means either a real vehicle -- in which
+ * case whatever s_obd_addressing has already locked onto from actual OBD
+ * responses tells us which scheme it uses -- or nothing conclusive yet. */
+static void obd_identify_partner(void)
+{
+    uint8_t ping[1] = { 0x01 };
+    s_identify_response[0] = 0;
+    s_identify_response[1] = 0;
+    s_identify_pending = true;
+    mcp2515_send(SIM_IDENTIFY_CAN_ID, false, sizeof(ping), ping);
+    bool got = xSemaphoreTake(s_identify_semaphore, pdMS_TO_TICKS(SIM_IDENTIFY_TIMEOUT_MS)) == pdTRUE;
+    s_identify_pending = false;
+
+    if (got && s_identify_response[0] == SIM_IDENTIFY_MAGIC) {
+        bool ext = s_identify_response[1] != 0;
+        portENTER_CRITICAL(&s_obd_addressing_lock);
+        s_obd_addressing = ext ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
+        portEXIT_CRITICAL(&s_obd_addressing_lock);
+        portENTER_CRITICAL(&s_obd_partner_lock);
+        s_obd_partner = ext ? OBD_PARTNER_SIM_29 : OBD_PARTNER_SIM_11;
+        portEXIT_CRITICAL(&s_obd_partner_lock);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_obd_addressing_lock);
+    obd_addressing_t addressing = s_obd_addressing;
+    portEXIT_CRITICAL(&s_obd_addressing_lock);
+    portENTER_CRITICAL(&s_obd_partner_lock);
+    if (addressing == OBD_ADDR_STANDARD) {
+        s_obd_partner = OBD_PARTNER_CAR_11;
+    } else if (addressing == OBD_ADDR_EXTENDED) {
+        s_obd_partner = OBD_PARTNER_CAR_29;
+    } else {
+        s_obd_partner = OBD_PARTNER_UNKNOWN;
+    }
+    portEXIT_CRITICAL(&s_obd_partner_lock);
+}
+
+static const char *obd_partner_to_string(obd_partner_t partner)
+{
+    switch (partner) {
+        case OBD_PARTNER_SIM_11: return "SIM_11";
+        case OBD_PARTNER_SIM_29: return "SIM_29";
+        case OBD_PARTNER_CAR_11: return "CAR_11";
+        case OBD_PARTNER_CAR_29: return "CAR_29";
+        default: return "UNKNOWN";
+    }
 }
 
 /* Sends Mode 04 (clear DTCs) as a functional broadcast and collects 0x44 acks
@@ -927,6 +1054,7 @@ static void obd_query_task(void *arg)
 {
     (void)arg;
     static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11 };
+    uint8_t consecutive_timeouts = 0;
 
     while (1) {
         obd_query_clear_dtcs_if_requested();
@@ -946,12 +1074,24 @@ static void obd_query_task(void *arg)
             s_obd_request_pending = false;
             if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
                 obd_print_response(pids[i], response.data, response.dlc);
+                consecutive_timeouts = 0;
             } else if (got) {
                 /* A stale/misordered response for a different PID; discard rather than misdecode it. */
                 ESP_LOGW(TAG, "OBD PID 0x%02x -> mismatched response (got pid 0x%02x), discarding",
                          pids[i], response.data[2]);
+                consecutive_timeouts = 0;
             } else {
                 ESP_LOGI(TAG, "OBD PID 0x%02x -> no response (timeout)", pids[i]);
+                /* Enough consecutive silence (on whichever scheme we'd locked
+                 * onto) means the vehicle/simulator may have changed --
+                 * re-probe both schemes again instead of staying stuck
+                 * asking only the one that used to work. */
+                if (++consecutive_timeouts >= OBD_ADDR_RESET_AFTER_TIMEOUTS) {
+                    consecutive_timeouts = 0;
+                    portENTER_CRITICAL(&s_obd_addressing_lock);
+                    s_obd_addressing = OBD_ADDR_UNKNOWN;
+                    portEXIT_CRITICAL(&s_obd_addressing_lock);
+                }
             }
 
             vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
@@ -981,7 +1121,8 @@ static void start_can_bridge(void)
      * queue up many frames in a burst (First Frame + several Consecutive
      * Frames, times however many ECUs answer) -- see obd_query_dtcs. */
     s_obd_response_queue = xQueueCreate(16, sizeof(obd_frame_t));
-    if (s_obd_response_queue == NULL) {
+    s_identify_semaphore = xSemaphoreCreateBinary();
+    if (s_obd_response_queue == NULL || s_identify_semaphore == NULL) {
         ESP_LOGE(TAG, "CAN bridge queue allocation failed");
         return;
     }
@@ -1559,6 +1700,59 @@ static esp_err_t dtc_simulate_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Re-runs the simulator/real-vehicle + addressing-scheme identify check on
+ * every call (not just cached from obd_query_task's background state) so the
+ * app's status display is always current, e.g. right after switching the
+ * simulator's mode below. */
+static esp_err_t can_partner_http_handler(httpd_req_t *request)
+{
+    obd_identify_partner();
+    portENTER_CRITICAL(&s_obd_partner_lock);
+    obd_partner_t partner = s_obd_partner;
+    portEXIT_CRITICAL(&s_obd_partner_lock);
+
+    char response[48];
+    snprintf(response, sizeof(response), "{\"partner\":\"%s\"}", obd_partner_to_string(partner));
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Only meaningful when the bench simulator is on the bus (SIM_MODE_SWITCH_CAN_ID
+ * is a private ID the simulator alone understands -- a real vehicle just
+ * ignores it, harmlessly). Body is "11" or "29". Resets s_obd_addressing so
+ * the next query re-probes instead of continuing to ask only the old scheme. */
+static esp_err_t can_sim_mode_http_handler(httpd_req_t *request)
+{
+    char mode[8] = {0};
+    int received = httpd_req_recv(request, mode, sizeof(mode) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected 11 or 29");
+        return ESP_FAIL;
+    }
+    mode[received] = '\0';
+
+    uint8_t payload;
+    if (strcmp(mode, "29") == 0) {
+        payload = 1;
+    } else if (strcmp(mode, "11") == 0) {
+        payload = 0;
+    } else {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected 11 or 29");
+        return ESP_FAIL;
+    }
+
+    mcp2515_send(SIM_MODE_SWITCH_CAN_ID, false, 1, &payload);
+    portENTER_CRITICAL(&s_obd_addressing_lock);
+    s_obd_addressing = OBD_ADDR_UNKNOWN;
+    portEXIT_CRITICAL(&s_obd_addressing_lock);
+    ESP_LOGI(TAG, "Simulator mode switch requested: %s-bit", mode);
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"simulator mode switch requested\"}");
+    return ESP_OK;
+}
+
 static esp_err_t can_capture_http_handler(httpd_req_t *request)
 {
     uint64_t after = 0;
@@ -1776,12 +1970,12 @@ static void start_frequency_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* Default max_uri_handlers is 8; we now register 10 (frequency, obd,
-     * can_capture, can_mode, gps, health, tasks, dtc, dtc_clear, dtc_simulate).
-     * Without raising this, registrations past the 8th silently fail
-     * (ESP_ERR_HTTPD_HANDLERS_FULL) instead of crashing, which is a much
-     * harder bug to notice -- endpoints just 404. */
-    config.max_uri_handlers = 12;
+    /* Default max_uri_handlers is 8; we now register 12 (frequency, obd,
+     * can_capture, can_mode, gps, health, tasks, dtc, dtc_clear, dtc_simulate,
+     * can_partner, can_sim_mode). Without raising this, registrations past
+     * the 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of
+     * crashing, which is a much harder bug to notice -- endpoints just 404. */
+    config.max_uri_handlers = 14;
     /* Default stack_size is 4096. can_capture_http_handler's local
      * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
      * the entire default stack, with nothing left for anything else in that
@@ -1837,6 +2031,16 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = dtc_simulate_http_handler,
     };
+    httpd_uri_t can_partner_uri = {
+        .uri = "/api/can/partner",
+        .method = HTTP_GET,
+        .handler = can_partner_http_handler,
+    };
+    httpd_uri_t can_sim_mode_uri = {
+        .uri = "/api/can/sim_mode",
+        .method = HTTP_POST,
+        .handler = can_sim_mode_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -1849,6 +2053,8 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &dtc_clear_uri);
         httpd_register_uri_handler(http_server, &dtc_simulate_uri);
         httpd_register_uri_handler(http_server, &tasks_uri);
+        httpd_register_uri_handler(http_server, &can_partner_uri);
+        httpd_register_uri_handler(http_server, &can_sim_mode_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
@@ -1857,6 +2063,7 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "Health API ready: GET /api/health");
         ESP_LOGI(TAG, "Tasks API ready: GET /api/tasks");
         ESP_LOGI(TAG, "DTC API ready: GET /api/dtc, POST /api/dtc/clear, POST /api/dtc/simulate");
+        ESP_LOGI(TAG, "CAN partner API ready: GET /api/can/partner, POST /api/can/sim_mode");
     }
 }
 
