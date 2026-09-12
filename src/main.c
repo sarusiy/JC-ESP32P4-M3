@@ -131,6 +131,14 @@ static volatile uint32_t blink_half_period_ms = 500;
 static bool wifi_started;
 static httpd_handle_t http_server;
 
+/* Always-on SoftAP so the phone can reach the board directly with zero setup
+ * (no home Wi-Fi needed, works anywhere) -- see run alongside the existing
+ * BLE-provisioned STA join (APSTA mode) so bench tools on the home network
+ * still work too. Fixed IP from ESP-IDF's default AP netif is 192.168.4.1. */
+#define WIFI_AP_SSID "CarTheftGuard-P4"
+#define WIFI_AP_PASSWORD "theftguard2026"
+#define WIFI_AP_IP "192.168.4.1"
+
 static const char *TAG = "main";
 /* Runtime log verbosity, changed live via the "ll" control-channel command. */
 static esp_log_level_t s_log_level = ESP_LOG_INFO;
@@ -1126,6 +1134,13 @@ static void gps_uart_task(void *arg)
 
     while (1) {
         int read = uart_read_bytes(GPS_UART_NUM, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(200));
+        if (read > 0) {
+            /* Temporary raw-byte diagnostic while bringing up a real GPS
+             * module -- shows exactly what's hitting the UART regardless of
+             * whether it parses as NMEA, to tell "nothing wired" apart from
+             * "wrong baud rate" (garbled bytes) at a glance. */
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, rx_buf, read, ESP_LOG_INFO);
+        }
         for (int i = 0; i < read; i++) {
             char c = (char)rx_buf[i];
             if (c == '\r') {
@@ -1870,7 +1885,7 @@ static bool start_wifi_connection(const char *ssid, const char *password, char *
      * that latch unconditionally before each connect attempt.
      */
     esp_wifi_stop();
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err == ESP_OK) {
         err = esp_wifi_set_config(WIFI_IF_STA, &config);
     }
@@ -1922,6 +1937,10 @@ static void start_hosted_wifi_link(void)
         ESP_LOGE(TAG, "WiFi STA netif create failed");
         return;
     }
+    if (esp_netif_create_default_wifi_ap() == NULL) {
+        ESP_LOGE(TAG, "WiFi AP netif create failed");
+        return;
+    }
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
@@ -1942,9 +1961,22 @@ static void start_hosted_wifi_link(void)
     };
     esp_wifi_set_country(&country);
 
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi set mode failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    wifi_config_t ap_config = {0};
+    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "%s", WIFI_AP_SSID);
+    ap_config.ap.ssid_len = strlen(WIFI_AP_SSID);
+    snprintf((char *)ap_config.ap.password, sizeof(ap_config.ap.password), "%s", WIFI_AP_PASSWORD);
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.channel = 6;
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi AP config failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -1963,6 +1995,18 @@ static void start_hosted_wifi_link(void)
 
     wifi_started = true;
     ESP_LOGI(TAG, "Hosted radio link is up (P4 host, C6 co-processor).");
+
+    /* The AP is live immediately (no "joining" step, unlike STA) -- treat the
+     * board as reachable right away instead of waiting for a STA DHCP lease
+     * that may never come if no home Wi-Fi is configured/in range. */
+    ESP_LOGI(TAG, "SoftAP up: ssid=%s ip=%s", WIFI_AP_SSID, WIFI_AP_IP);
+    start_frequency_http_server();
+#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
+    snprintf(s_wifi_ip, sizeof(s_wifi_ip), "%s", WIFI_AP_IP);
+    char ap_response[64];
+    snprintf(ap_response, sizeof(ap_response), "WiFi connected ip=%s\r\n", WIFI_AP_IP);
+    ble_publish_response(BLE_HS_CONN_HANDLE_NONE, ap_response);
+#endif
 }
 #else
 static void start_hosted_wifi_link(void)
