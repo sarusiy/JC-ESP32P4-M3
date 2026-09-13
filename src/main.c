@@ -914,6 +914,20 @@ static void obd_send_request(const uint8_t *request, uint8_t len)
  * responses tells us which scheme it uses -- or nothing conclusive yet. */
 static void obd_identify_partner(void)
 {
+    if (s_can_passive) {
+        /* Listen-only mode physically can't transmit the identify ping (or
+         * any OBD request), so nothing about the partner is knowable right
+         * now. Report UNKNOWN instead of falling through to the "no reply
+         * means real vehicle" inference below, which would otherwise
+         * misreport a stale addressing lock as CAR_11/CAR_29 even though
+         * the real reason is "we're not allowed to ask", not "a car
+         * answered instead of the simulator". */
+        portENTER_CRITICAL(&s_obd_partner_lock);
+        s_obd_partner = OBD_PARTNER_UNKNOWN;
+        portEXIT_CRITICAL(&s_obd_partner_lock);
+        return;
+    }
+
     uint8_t ping[1] = { 0x01 };
     for (int attempt = 0; attempt < SIM_IDENTIFY_ATTEMPTS; attempt++) {
         s_identify_response[0] = 0;
