@@ -22,5 +22,10 @@ dependencies.lock
 Doc/**/*.zip
 
 # Raw CAN capture data pulled from the phone for offline analysis; local
-# working data, not source -- keep it on disk, out of the repo.
-captures/
+# working data, not source -- keep it on disk, out of the repo. The
+# written-up .md analysis docs ARE tracked though, so findings survive
+# and are readable/updatable from any machine, not just wherever the
+# raw CSVs happen to be sitting.
+captures/**
+!captures/**/
+!captures/**/*.md
