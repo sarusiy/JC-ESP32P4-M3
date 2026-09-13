@@ -60,3 +60,28 @@ CONFIG_BT_CONTROLLER_DISABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 # CONFIG_BT_NIMBLE_TRANSPORT_UART is not set
 CONFIG_BT_BLE_ENABLED=y
+
+# OTA-capable partition table (see partitions.csv): two app slots so the
+# phone app can push a new firmware image over the board's own Wi-Fi
+# (POST /api/ota) instead of always needing a USB/PC visit. Rollback lets
+# the bootloader automatically revert to the previous image if a bad push
+# crash-loops -- the safety net that makes this acceptable to do away from
+# USB/JTAG. sdkconfig itself is gitignored (auto-generated), so these must
+# live here to survive a fresh checkout.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Pinned because a from-scratch sdkconfig regeneration (done while verifying
+# the OTA settings above actually survive a fresh checkout) silently drifted
+# onto Picolibc + stricter orphan-sections-as-error instead of this project's
+# actual, verified-on-hardware toolchain choice -- Kconfig's own defaults for
+# these evidently moved since this sdkconfig was first generated. Pinning
+# keeps a fresh checkout building the same toolchain that's been tested,
+# rather than whatever ESP-IDF's current defaults happen to resolve to.
+CONFIG_LIBC_NEWLIB=y
+# CONFIG_LIBC_PICOLIBC is not set
+CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
+# CONFIG_COMPILER_ORPHAN_SECTIONS_ERROR is not set
+CONFIG_FREERTOS_IN_IRAM=y

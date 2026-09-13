@@ -1,0 +1,12 @@
+# ESP32-P4 partition table -- OTA-capable (two app slots), replacing the
+# single-app default so firmware can be updated from the phone app over the
+# board's own Wi-Fi link instead of always requiring a USB/PC visit. Sized
+# against a 16MB flash chip (see GET /api/health -> flash_size) with the
+# previous single-app image at ~984KB -- 1.5MB per OTA slot leaves generous
+# headroom for the app to keep growing, at a fraction of the available flash.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x180000,
+ota_1,    app,  ota_1,   ,         0x180000,
