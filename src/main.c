@@ -1098,6 +1098,10 @@ static void obd_query_task(void *arg)
     (void)arg;
     static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11, 0x20 };
     uint8_t consecutive_timeouts = 0;
+    /* Which physical ECU's responses to trust, once one has answered -- see
+     * the response-check below for why this exists. 0 means "not locked
+     * yet" (no real CAN ID is ever exactly 0 for either addressing scheme). */
+    uint32_t responder_id = 0;
 
     while (1) {
         obd_query_clear_dtcs_if_requested();
@@ -1115,8 +1119,35 @@ static void obd_query_task(void *arg)
             obd_frame_t response;
             bool got = xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
             s_obd_request_pending = false;
-            if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
+            /* Real cars (unlike the single-ECU bench simulator) can have more
+             * than one module willing to answer a functional-broadcast Mode
+             * 01 request -- e.g. a gateway or a second controller that also
+             * claims a PID but only ever echoes a stale/static value. Only
+             * checking the PID-echo byte (data[2]) let a secondary ECU's
+             * frozen answer get accepted just as readily as the real,
+             * continuously-updating one from the correct ECU, which looked
+             * exactly like "reads a plausible value once, then never moves
+             * again" -- confirmed on a real car (Fabia) where RPM read a
+             * believable idle value but never tracked the accelerator.
+             * Lock onto whichever id answers first for this PID sequence
+             * and require the same id afterward, mirroring how
+             * s_obd_addressing itself locks onto the first scheme that
+             * answers. */
+            bool id_ok = (responder_id == 0) || (response.id == responder_id);
+            if (got && response.dlc >= 3 && response.data[2] == pids[i] && id_ok) {
+                if (responder_id == 0) {
+                    responder_id = response.id;
+                    ESP_LOGI(TAG, "OBD responder locked to id 0x%lx", (unsigned long)responder_id);
+                }
                 obd_print_response(pids[i], response.data, response.dlc);
+                consecutive_timeouts = 0;
+            } else if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
+                /* Right PID, wrong ECU -- a secondary module answering the
+                 * same broadcast request. Discard; the locked ECU's own
+                 * answer (if any) either already arrived or times out below
+                 * like normal silence. */
+                ESP_LOGW(TAG, "OBD PID 0x%02x -> answered by id 0x%lx, not the locked responder 0x%lx; discarding",
+                         pids[i], (unsigned long)response.id, (unsigned long)responder_id);
                 consecutive_timeouts = 0;
             } else if (got) {
                 /* A stale/misordered response for a different PID; discard rather than misdecode it. */
@@ -1128,9 +1159,13 @@ static void obd_query_task(void *arg)
                 /* Enough consecutive silence (on whichever scheme we'd locked
                  * onto) means the vehicle/simulator may have changed --
                  * re-probe both schemes again instead of staying stuck
-                 * asking only the one that used to work. */
+                 * asking only the one that used to work. Also drop the
+                 * responder lock so a genuinely different/replacement ECU
+                 * can be discovered fresh, same reasoning as the addressing
+                 * reset. */
                 if (++consecutive_timeouts >= OBD_ADDR_RESET_AFTER_TIMEOUTS) {
                     consecutive_timeouts = 0;
+                    responder_id = 0;
                     portENTER_CRITICAL(&s_obd_addressing_lock);
                     s_obd_addressing = OBD_ADDR_UNKNOWN;
                     portEXIT_CRITICAL(&s_obd_addressing_lock);
