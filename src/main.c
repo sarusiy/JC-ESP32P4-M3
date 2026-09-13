@@ -116,6 +116,14 @@
 #define SIM_MODE_SWITCH_CAN_ID 0x703
 #define SIM_IDENTIFY_MAGIC     0xA5
 #define SIM_IDENTIFY_TIMEOUT_MS 250
+/* The identify ping is a one-off, low-priority message competing with a lot
+ * of continuous traffic (OBD queries, the periodic broadcasts) -- on a busy
+ * bus it, or its reply, can occasionally get lost to contention alone, with
+ * no simulator/real-car ambiguity involved. A single failed attempt used to
+ * be read as "no simulator -> must be a real car", which was wrong; retrying
+ * a few times before concluding that fixes it, since re-sending compensates
+ * for transient loss in a way a longer single wait would not. */
+#define SIM_IDENTIFY_ATTEMPTS 3
 #define OBD_MODE_CURRENT_DATA 0x01
 #define OBD_MODE_REQUEST_DTC 0x03
 #define OBD_MODE_CLEAR_DTC 0x04
@@ -907,24 +915,29 @@ static void obd_send_request(const uint8_t *request, uint8_t len)
 static void obd_identify_partner(void)
 {
     uint8_t ping[1] = { 0x01 };
-    s_identify_response[0] = 0;
-    s_identify_response[1] = 0;
-    s_identify_pending = true;
-    mcp2515_send(SIM_IDENTIFY_CAN_ID, false, sizeof(ping), ping);
-    bool got = xSemaphoreTake(s_identify_semaphore, pdMS_TO_TICKS(SIM_IDENTIFY_TIMEOUT_MS)) == pdTRUE;
-    s_identify_pending = false;
+    for (int attempt = 0; attempt < SIM_IDENTIFY_ATTEMPTS; attempt++) {
+        s_identify_response[0] = 0;
+        s_identify_response[1] = 0;
+        s_identify_pending = true;
+        mcp2515_send(SIM_IDENTIFY_CAN_ID, false, sizeof(ping), ping);
+        bool got = xSemaphoreTake(s_identify_semaphore, pdMS_TO_TICKS(SIM_IDENTIFY_TIMEOUT_MS)) == pdTRUE;
+        s_identify_pending = false;
 
-    if (got && s_identify_response[0] == SIM_IDENTIFY_MAGIC) {
-        bool ext = s_identify_response[1] != 0;
-        portENTER_CRITICAL(&s_obd_addressing_lock);
-        s_obd_addressing = ext ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
-        portEXIT_CRITICAL(&s_obd_addressing_lock);
-        portENTER_CRITICAL(&s_obd_partner_lock);
-        s_obd_partner = ext ? OBD_PARTNER_SIM_29 : OBD_PARTNER_SIM_11;
-        portEXIT_CRITICAL(&s_obd_partner_lock);
-        return;
+        if (got && s_identify_response[0] == SIM_IDENTIFY_MAGIC) {
+            bool ext = s_identify_response[1] != 0;
+            portENTER_CRITICAL(&s_obd_addressing_lock);
+            s_obd_addressing = ext ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
+            portEXIT_CRITICAL(&s_obd_addressing_lock);
+            portENTER_CRITICAL(&s_obd_partner_lock);
+            s_obd_partner = ext ? OBD_PARTNER_SIM_29 : OBD_PARTNER_SIM_11;
+            portEXIT_CRITICAL(&s_obd_partner_lock);
+            return;
+        }
     }
 
+    /* All attempts failed -- only now infer a real vehicle from whatever
+     * addressing scheme real OBD traffic has already locked onto (or
+     * UNKNOWN if nothing has answered at all yet). */
     portENTER_CRITICAL(&s_obd_addressing_lock);
     obd_addressing_t addressing = s_obd_addressing;
     portEXIT_CRITICAL(&s_obd_addressing_lock);
