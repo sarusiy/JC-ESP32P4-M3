@@ -2,9 +2,12 @@
 Live monitor for the P4's GPS bridge (NEO-6M/8M module on UART1,
 GPIO34=RX/GPIO35=TX -- see main.c GPS_UART_*). Polls GET /api/gps
 once a second and prints the parsed fix.
+
+The board is AP-only (no home Wi-Fi/STA support) -- join this PC's Wi-Fi
+to CarTheftGuard-P4 (password theftguard2026) before running this.
 #>
 param(
-    [string]$BoardIp = '192.168.1.180',
+    [string]$BoardIp = '192.168.4.1',
     [int]$PollSeconds = 1
 )
 

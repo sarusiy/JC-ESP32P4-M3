@@ -5,9 +5,12 @@ already parsed from the raw frames (see can-monitor.ps1 for raw frames).
 Note: these only update while CAN mode is ACTIVE (Active mode is what
 actually sends the Mode 01 queries -- Passive only listens). Switch mode
 first via the Control tab or POST /api/can/mode.
+
+The board is AP-only (no home Wi-Fi/STA support) -- join this PC's Wi-Fi
+to CarTheftGuard-P4 (password theftguard2026) before running this.
 #>
 param(
-    [string]$BoardIp = '192.168.1.180',
+    [string]$BoardIp = '192.168.4.1',
     [int]$PollSeconds = 1
 )
 

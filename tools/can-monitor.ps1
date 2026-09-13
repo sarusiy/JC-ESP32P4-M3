@@ -1,5 +1,9 @@
+<#
+The board is AP-only (no home Wi-Fi/STA support) -- join this PC's Wi-Fi
+to CarTheftGuard-P4 (password theftguard2026) before running this.
+#>
 param(
-    [string]$BoardIp = '192.168.1.180',
+    [string]$BoardIp = '192.168.4.1',
     [ValidateSet('summary','live')]
     [string]$Mode = 'summary',
     [int]$PollSeconds = 1
