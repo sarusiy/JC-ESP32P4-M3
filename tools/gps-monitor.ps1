@@ -13,6 +13,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Host "Board is AP-only -- join this PC's Wi-Fi to CarTheftGuard-P4 (password theftguard2026) first." -ForegroundColor DarkGray
+
 while ($true) {
     try {
         $gps = Invoke-RestMethod -Uri "http://$BoardIp/api/gps" -Method Get -TimeoutSec 5
@@ -24,7 +26,7 @@ while ($true) {
             Write-Host ("[{0}] Waiting for fix... sats={1}" -f $ts, $gps.satellites)
         }
     } catch {
-        Write-Host "Waiting for board at http://$BoardIp ..."
+        Write-Host "Waiting for board at http://$BoardIp -- is this PC joined to CarTheftGuard-P4?"
         Write-Host $_.Exception.Message
     }
     Start-Sleep -Seconds $PollSeconds

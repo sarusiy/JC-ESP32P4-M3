@@ -16,6 +16,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Host "Board is AP-only -- join this PC's Wi-Fi to CarTheftGuard-P4 (password theftguard2026) first." -ForegroundColor DarkGray
+
 while ($true) {
     try {
         $obd = Invoke-RestMethod -Uri "http://$BoardIp/api/obd" -Method Get -TimeoutSec 5
@@ -23,7 +25,7 @@ while ($true) {
         Write-Host ("[{0}] RPM={1} Speed={2}km/h Coolant={3}C Throttle={4}% SupportedPIDs={5}" -f `
             $ts, $obd.rpm, $obd.speed_kmh, $obd.coolant_c, $obd.throttle_pct, $obd.supported_pids)
     } catch {
-        Write-Host "Waiting for board at http://$BoardIp ..."
+        Write-Host "Waiting for board at http://$BoardIp -- is this PC joined to CarTheftGuard-P4?"
         Write-Host $_.Exception.Message
     }
     Start-Sleep -Seconds $PollSeconds

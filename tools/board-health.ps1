@@ -14,10 +14,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Host "Board is AP-only -- join this PC's Wi-Fi to CarTheftGuard-P4 (password theftguard2026) first." -ForegroundColor DarkGray
+
 try {
     $health = Invoke-RestMethod -Uri "http://$BoardIp/api/health" -TimeoutSec 5
     $health | ConvertTo-Json -Depth 5
 } catch {
-    Write-Host "Could not reach board at http://$BoardIp -- is it on Wi-Fi?"
+    Write-Host "Could not reach board at http://$BoardIp -- is this PC joined to CarTheftGuard-P4?"
     Write-Host $_.Exception.Message
 }

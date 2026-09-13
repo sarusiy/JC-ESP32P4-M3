@@ -11,6 +11,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Host "Board is AP-only -- join this PC's Wi-Fi to CarTheftGuard-P4 (password theftguard2026) first." -ForegroundColor DarkGray
+
 function Get-CanStatus {
     param([string]$Board)
     $uri = "http://$Board/api/can?after=$after"
@@ -46,7 +48,7 @@ while ($true) {
         }
     }
     catch {
-        Write-Host "Waiting for board at http://$BoardIp ..."
+        Write-Host "Waiting for board at http://$BoardIp -- is this PC joined to CarTheftGuard-P4?"
         Write-Host $_.Exception.Message
     }
 
