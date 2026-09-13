@@ -84,7 +84,7 @@ static uint8_t spi_transfer_byte(uint8_t out)
 
 static void mcp2515_cmd(const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_spi_mutex, portMAX_DELAY);
     gpio_set_level(s_cs_gpio, 0);
     ets_delay_us(BITBANG_HALF_PERIOD_US);
     for (size_t i = 0; i < len; i++) {
@@ -95,7 +95,7 @@ static void mcp2515_cmd(const uint8_t *tx, uint8_t *rx, size_t len)
     }
     ets_delay_us(BITBANG_HALF_PERIOD_US);
     gpio_set_level(s_cs_gpio, 1);
-    xSemaphoreGive(s_spi_mutex);
+    xSemaphoreGiveRecursive(s_spi_mutex);
 }
 
 static uint8_t mcp2515_read_reg(uint8_t addr)
@@ -144,7 +144,7 @@ esp_err_t mcp2515_init(const mcp2515_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_spi_mutex = xSemaphoreCreateMutex();
+    s_spi_mutex = xSemaphoreCreateRecursiveMutex();
     if (s_spi_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -292,6 +292,22 @@ esp_err_t mcp2515_set_listen_only(bool enabled)
 
 esp_err_t mcp2515_send(uint32_t id, bool extended, uint8_t dlc, const uint8_t *data)
 {
+    /* mcp2515_cmd() protects each individual SPI transaction, but writing
+     * the TX buffer and triggering RTS below are two SEPARATE transactions
+     * with the mutex released in between. Every caller (OBD polling,
+     * DTC queries, the SIM_IDENTIFY ping, fault injection, ISO-TP flow
+     * control...) shares the one TXB0 hardware buffer, so without an outer
+     * lock spanning both steps, two tasks calling this concurrently could
+     * interleave: task B's buffer write lands between task A's write and
+     * its RTS, and task A's RTS then transmits task B's frame instead of
+     * its own -- silently corrupting or losing one or both. Rare on a quiet
+     * bench setup with a single sender at a time; real under real-car
+     * traffic with multiple tasks (periodic OBD polling, HTTP-triggered
+     * identify pings, etc.) actually sending concurrently. The mutex is
+     * recursive so this outer lock nests safely with mcp2515_cmd()'s own
+     * inner lock from the same task. */
+    xSemaphoreTakeRecursive(s_spi_mutex, portMAX_DELAY);
+
     if (dlc > 8) {
         dlc = 8;
     }
@@ -327,5 +343,7 @@ esp_err_t mcp2515_send(uint32_t id, bool extended, uint8_t dlc, const uint8_t *d
 
     uint8_t rts = MCP_RTS_TXB0;
     mcp2515_cmd(&rts, NULL, 1);
+
+    xSemaphoreGiveRecursive(s_spi_mutex);
     return ESP_OK;
 }
