@@ -455,6 +455,50 @@ static volatile bool s_obd_request_pending;
 /* Filled by can_echo_task whenever it sees an 0x7E8 response, drained by obd_query_task. */
 static QueueHandle_t s_obd_response_queue;
 
+/* UDS DID-sweep discovery tool -- see captures/fabia_2026/UDS_BODY_MODULE_RESEARCH.md.
+ * Unlike Mode 01's functional broadcast (one shared request ID, a range of
+ * possible response IDs, responder-lock to pick one), UDS body-module
+ * requests are point-to-point: one exact request ID, one exact response ID,
+ * known in advance -- no ambiguity to resolve, but also nothing in the
+ * existing OBD response routing recognizes these IDs at all. Routed via
+ * its own queue/pending-flag pair, exact-ID-match only, mirroring
+ * s_obd_request_pending/s_obd_response_queue's role for Mode 01. */
+static volatile bool s_uds_request_pending;
+static volatile uint32_t s_uds_expected_response_id;
+static QueueHandle_t s_uds_response_queue;
+
+typedef enum {
+    UDS_SCAN_IDLE = 0,
+    UDS_SCAN_RUNNING,
+    UDS_SCAN_DONE,
+    UDS_SCAN_ERROR,
+} uds_scan_state_t;
+
+#define UDS_SCAN_MAX_RESULTS 64
+#define UDS_SCAN_MAX_RANGE 512
+
+typedef struct {
+    uint16_t did;
+    uint8_t dlc;
+    uint8_t data[8]; /* raw positive-response payload (service+DID+value bytes), truncated to 8 */
+} uds_scan_result_t;
+
+typedef struct {
+    uint32_t request_id;
+    uint32_t response_id;
+    bool extended;
+    uint16_t did_start;
+    uint16_t did_end;
+    uds_scan_state_t state;
+    uint16_t current_did; /* progress indicator while running */
+    uint8_t result_count;
+    uds_scan_result_t results[UDS_SCAN_MAX_RESULTS];
+} uds_scan_t;
+
+static uds_scan_t s_uds_scan;
+static portMUX_TYPE s_uds_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_uds_scan_requested;
+
 /* Which OBD-II addressing scheme has actually gotten a response so far.
  * UNKNOWN means "haven't heard back on either scheme yet" -- obd_send_request
  * probes both in that state; once one responds, every later query sticks to
@@ -646,6 +690,19 @@ static void can_echo_task(void *arg)
         while (drained < CAN_CAPTURE_HTTP_BATCH && mcp2515_receive(&id, NULL, &dlc, data)) {
             drained++;
             capture_can_frame(id, dlc, data);
+            /* UDS scan response routing: exact-ID match only, checked before
+             * everything else below since a UDS response ID is arbitrary
+             * (whatever the target module answers on) and could in principle
+             * collide with another branch's own ID check otherwise. Only
+             * routed while a scan request is actually outstanding. */
+            if (s_uds_request_pending && id == s_uds_expected_response_id) {
+                obd_frame_t frame = { .id = id, .dlc = dlc };
+                memcpy(frame.data, data, sizeof(frame.data));
+                if (xQueueSend(s_uds_response_queue, &frame, 0) != pdPASS) {
+                    ESP_LOGW(TAG, "UDS response queue full; dropping response");
+                }
+                continue;
+            }
             if (id == SIM_IDENTIFY_CAN_ID) {
                 if (s_identify_pending && dlc >= 2) {
                     s_identify_response[0] = data[0];
@@ -1206,6 +1263,105 @@ static void obd_query_vin_if_requested(void)
     ESP_LOGI(TAG, "VIN read -> %s", ok ? vin : "no response (timeout)");
 }
 
+/* Sends UDS ReadDataByIdentifier (service 0x22) for one DID to a specific
+ * module and waits for its response. Point-to-point (exact request/response
+ * CAN ID pair, supplied by the caller) rather than obd_send_request's
+ * dual-scheme functional broadcast -- see UDS_BODY_MODULE_RESEARCH.md for
+ * why body-module UDS doesn't need (or want) that ambiguity-resolution
+ * machinery. Reuses isotp_reassemble for multi-frame responses since that
+ * logic is generic ISO-TP, not Mode-01-specific. */
+static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extended,
+                          uint16_t did, uint8_t *out_payload, uint8_t *out_len)
+{
+    uint8_t request[8] = { 0x03, 0x22, (uint8_t)(did >> 8), (uint8_t)did, 0, 0, 0, 0 };
+
+    s_uds_expected_response_id = response_id;
+    s_uds_request_pending = true;
+    mcp2515_send(request_id, extended, sizeof(request), request);
+
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_RESPONSE_TIMEOUT_MS * 1000);
+    obd_frame_t response;
+    bool got = xQueueReceive(s_uds_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+    s_uds_request_pending = false;
+    if (!got) {
+        return false;
+    }
+    return isotp_reassemble(response.id, &response, out_payload, out_len, deadline_us);
+}
+
+/* Services a UDS DID-sweep request set up by uds_scan_start_http_handler:
+ * reads every DID in the requested range from one target module, recording
+ * only positive responses (0x62 = 0x22 + 0x40, echoing the requested DID)
+ * -- a negative response (0x7F) or timeout means "nothing useful here" for
+ * this discovery tool and is logged but not stored, to keep the result
+ * table focused on real hits. Runs inline in obd_query_task like the VIN
+ * read, since it shares the same single in-flight CAN request/response
+ * slot; a full sweep can take a while (up to ~700ms per DID if it times
+ * out), which is fine for a manually-triggered one-shot tool. */
+static void obd_query_uds_scan_if_requested(void)
+{
+    if (!s_uds_scan_requested) {
+        return;
+    }
+    s_uds_scan_requested = false;
+
+    uint32_t request_id, response_id;
+    bool extended;
+    uint16_t did_start, did_end;
+    portENTER_CRITICAL(&s_uds_scan_lock);
+    request_id = s_uds_scan.request_id;
+    response_id = s_uds_scan.response_id;
+    extended = s_uds_scan.extended;
+    did_start = s_uds_scan.did_start;
+    did_end = s_uds_scan.did_end;
+    portEXIT_CRITICAL(&s_uds_scan_lock);
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "UDS scan requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_uds_scan_lock);
+        s_uds_scan.state = UDS_SCAN_ERROR;
+        portEXIT_CRITICAL(&s_uds_scan_lock);
+        return;
+    }
+
+    ESP_LOGI(TAG, "UDS scan starting: req=0x%lx resp=0x%lx did=0x%04x-0x%04x",
+             (unsigned long)request_id, (unsigned long)response_id, did_start, did_end);
+
+    for (uint32_t did = did_start; did <= did_end; did++) {
+        portENTER_CRITICAL(&s_uds_scan_lock);
+        s_uds_scan.current_did = (uint16_t)did;
+        portEXIT_CRITICAL(&s_uds_scan_lock);
+
+        uint8_t payload[ISOTP_MAX_PAYLOAD];
+        uint8_t payload_len = 0;
+        bool ok = uds_read_did(request_id, response_id, extended, (uint16_t)did, payload, &payload_len);
+
+        if (ok && payload_len >= 3 && payload[0] == 0x62 &&
+            (uint16_t)(((uint16_t)payload[1] << 8) | payload[2]) == (uint16_t)did) {
+            portENTER_CRITICAL(&s_uds_scan_lock);
+            if (s_uds_scan.result_count < UDS_SCAN_MAX_RESULTS) {
+                uds_scan_result_t *result = &s_uds_scan.results[s_uds_scan.result_count++];
+                result->did = (uint16_t)did;
+                result->dlc = payload_len > 8 ? 8 : payload_len;
+                memcpy(result->data, payload, result->dlc);
+            }
+            portEXIT_CRITICAL(&s_uds_scan_lock);
+            ESP_LOGI(TAG, "UDS scan: DID 0x%04x -> positive response (%u bytes)", (unsigned)did, payload_len);
+        } else if (ok && payload_len >= 3 && payload[0] == 0x7F) {
+            ESP_LOGD(TAG, "UDS scan: DID 0x%04x -> negative response, NRC 0x%02x", (unsigned)did, payload[2]);
+        } else if (!ok) {
+            ESP_LOGD(TAG, "UDS scan: DID 0x%04x -> timeout", (unsigned)did);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+    }
+
+    portENTER_CRITICAL(&s_uds_scan_lock);
+    s_uds_scan.state = UDS_SCAN_DONE;
+    portEXIT_CRITICAL(&s_uds_scan_lock);
+    ESP_LOGI(TAG, "UDS scan complete: %u DID(s) responded", (unsigned)s_uds_scan.result_count);
+}
+
 /* Acts as a minimal scan tool: requests each supported PID in turn on the
  * broadcast functional ID, waits for the ECU's 0x7E8 reply, and prints it. */
 static void obd_query_task(void *arg)
@@ -1221,6 +1377,7 @@ static void obd_query_task(void *arg)
     while (1) {
         obd_query_clear_dtcs_if_requested();
         obd_query_vin_if_requested();
+        obd_query_uds_scan_if_requested();
 
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
             if (s_can_passive) {
@@ -1315,8 +1472,9 @@ static void start_can_bridge(void)
      * queue up many frames in a burst (First Frame + several Consecutive
      * Frames, times however many ECUs answer) -- see obd_query_dtcs. */
     s_obd_response_queue = xQueueCreate(16, sizeof(obd_frame_t));
+    s_uds_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
     s_identify_semaphore = xSemaphoreCreateBinary();
-    if (s_obd_response_queue == NULL || s_identify_semaphore == NULL) {
+    if (s_obd_response_queue == NULL || s_uds_response_queue == NULL || s_identify_semaphore == NULL) {
         ESP_LOGE(TAG, "CAN bridge queue allocation failed");
         return;
     }
@@ -1899,6 +2057,91 @@ static esp_err_t vin_read_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Kicks off a UDS DID-sweep against one target module -- see
+ * captures/fabia_2026/UDS_BODY_MODULE_RESEARCH.md. Body (plain text):
+ * "req,resp,extended,did_start,did_end" -- req/resp/did_start/did_end in
+ * hex without a 0x prefix, extended is 0 or 1, e.g. "71E,788,0,100,200"
+ * to sweep DIDs 0x100-0x200 against request 0x71E / response 0x788. */
+static esp_err_t uds_scan_start_http_handler(httpd_req_t *request)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected req,resp,extended,did_start,did_end");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    unsigned long req_id = 0, resp_id = 0, extended = 0, did_start = 0, did_end = 0;
+    if (sscanf(body, "%lx,%lx,%lu,%lx,%lx", &req_id, &resp_id, &extended, &did_start, &did_end) != 5) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                             "Expected req,resp,extended,did_start,did_end (hex,hex,0|1,hex,hex)");
+        return ESP_FAIL;
+    }
+    if (did_end < did_start || (did_end - did_start + 1) > UDS_SCAN_MAX_RANGE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "DID range invalid or too large (max 512 DIDs)");
+        return ESP_FAIL;
+    }
+
+    portENTER_CRITICAL(&s_uds_scan_lock);
+    s_uds_scan.request_id = (uint32_t)req_id;
+    s_uds_scan.response_id = (uint32_t)resp_id;
+    s_uds_scan.extended = extended != 0;
+    s_uds_scan.did_start = (uint16_t)did_start;
+    s_uds_scan.did_end = (uint16_t)did_end;
+    s_uds_scan.current_did = (uint16_t)did_start;
+    s_uds_scan.result_count = 0;
+    s_uds_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_uds_scan_lock);
+    s_uds_scan_requested = true;
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"uds scan requested\"}");
+    return ESP_OK;
+}
+
+/* Returns current progress/results of the last (or in-progress) UDS scan. */
+static esp_err_t uds_scan_status_http_handler(httpd_req_t *request)
+{
+    uds_scan_t snapshot;
+    portENTER_CRITICAL(&s_uds_scan_lock);
+    snapshot = s_uds_scan;
+    portEXIT_CRITICAL(&s_uds_scan_lock);
+
+    const char *state_str;
+    switch (snapshot.state) {
+        case UDS_SCAN_RUNNING: state_str = "running"; break;
+        case UDS_SCAN_DONE: state_str = "done"; break;
+        case UDS_SCAN_ERROR: state_str = "error"; break;
+        default: state_str = "idle"; break;
+    }
+
+    /* Sized for UDS_SCAN_MAX_RESULTS entries at up to ~48 bytes of JSON each. */
+    static char response[UDS_SCAN_MAX_RESULTS * 48 + 160];
+    int written = snprintf(response, sizeof(response),
+            "{\"state\":\"%s\",\"current_did\":\"0x%04x\",\"result_count\":%u,\"results\":[",
+            state_str, snapshot.current_did, snapshot.result_count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < snapshot.result_count && used < sizeof(response); i++) {
+        char hex[17] = {0};
+        uint8_t hex_bytes = snapshot.results[i].dlc > 8 ? 8 : snapshot.results[i].dlc;
+        for (uint8_t b = 0; b < hex_bytes; b++) {
+            snprintf(hex + b * 2, 3, "%02X", snapshot.results[i].data[b]);
+        }
+        written = snprintf(response + used, sizeof(response) - used,
+                "%s{\"did\":\"0x%04x\",\"data\":\"%s\"}",
+                i == 0 ? "" : ",", snapshot.results[i].did, hex);
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static esp_err_t ota_status_http_handler(httpd_req_t *request)
 {
     const char *state_str;
@@ -2321,7 +2564,7 @@ static void start_frequency_http_server(void)
      * can_partner, can_sim_mode). Without raising this, registrations past
      * the 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of
      * crashing, which is a much harder bug to notice -- endpoints just 404. */
-    config.max_uri_handlers = 18;
+    config.max_uri_handlers = 20;
     /* Default stack_size is 4096. can_capture_http_handler's local
      * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
      * the entire default stack, with nothing left for anything else in that
@@ -2407,6 +2650,16 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = ota_http_handler,
     };
+    httpd_uri_t uds_scan_status_uri = {
+        .uri = "/api/uds/scan",
+        .method = HTTP_GET,
+        .handler = uds_scan_status_http_handler,
+    };
+    httpd_uri_t uds_scan_start_uri = {
+        .uri = "/api/uds/scan",
+        .method = HTTP_POST,
+        .handler = uds_scan_start_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -2425,6 +2678,8 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &vin_read_uri);
         httpd_register_uri_handler(http_server, &ota_status_uri);
         httpd_register_uri_handler(http_server, &ota_uri);
+        httpd_register_uri_handler(http_server, &uds_scan_status_uri);
+        httpd_register_uri_handler(http_server, &uds_scan_start_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
@@ -2436,6 +2691,7 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "CAN partner API ready: GET /api/can/partner, POST /api/can/sim_mode");
         ESP_LOGI(TAG, "VIN API ready: GET /api/obd/vin, POST /api/obd/vin");
         ESP_LOGI(TAG, "OTA API ready: GET /api/ota (status), POST /api/ota (push new firmware image)");
+        ESP_LOGI(TAG, "UDS scan API ready: GET /api/uds/scan (status/results), POST /api/uds/scan (req,resp,extended,did_start,did_end)");
     }
 }
 
