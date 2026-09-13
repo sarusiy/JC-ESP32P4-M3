@@ -157,13 +157,11 @@
 
 /* Half-period of the blink, in ms; changed live from the control channel. */
 static volatile uint32_t blink_half_period_ms = 500;
-static bool wifi_started;
 static httpd_handle_t http_server;
 
-/* Always-on SoftAP so the phone can reach the board directly with zero setup
- * (no home Wi-Fi needed, works anywhere) -- see run alongside the existing
- * BLE-provisioned STA join (APSTA mode) so bench tools on the home network
- * still work too. Fixed IP from ESP-IDF's default AP netif is 192.168.4.1. */
+/* Always-on SoftAP, AP-only (no STA/home-Wi-Fi support at all) -- the phone
+ * always reaches the board the same way, anywhere, with zero setup: join
+ * this network. Fixed IP from ESP-IDF's default AP netif is 192.168.4.1. */
 #define WIFI_AP_SSID "CarTheftGuard-P4"
 #define WIFI_AP_PASSWORD "theftguard2026"
 #define WIFI_AP_IP "192.168.4.1"
@@ -488,13 +486,12 @@ static void IRAM_ATTR can_int_isr(void *arg)
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 static void ble_publish_response(uint16_t conn_handle, const char *message);
 
-/* Last known Wi-Fi IP, set once by wifi_event_handler on IP_EVENT_STA_GOT_IP.
- * The board joins Wi-Fi (auto-reconnecting from NVS-saved credentials) well
- * before a phone typically re-pairs over BLE, so the one-shot "WiFi connected
- * ip=..." notify fires and is missed if nobody is subscribed yet. Caching the
- * IP here lets ble_gap_event() resend it the moment a central (re)subscribes,
- * without requiring the user to re-provision Wi-Fi credentials every time. */
-static char s_wifi_ip[16];
+/* The board is AP-only (no home Wi-Fi/STA support) -- its IP is always the
+ * fixed WIFI_AP_IP constant, never anything learned dynamically. This just
+ * tracks whether the AP is up yet, so ble_gap_event() knows whether it's
+ * safe to resend "WiFi connected ip=..." the moment a central (re)subscribes
+ * (see BLE_GAP_EVENT_SUBSCRIBE handling below). */
+static bool s_wifi_ready;
 #endif
 
 /* Shared command parser used by USB CDC and future companion transport. */
@@ -2094,85 +2091,6 @@ static void start_frequency_http_server(void)
     }
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
-{
-    (void)arg;
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = event_data;
-        char address[16];
-        esp_ip4addr_ntoa(&event->ip_info.ip, address, sizeof(address));
-        ESP_LOGI(TAG, "WiFi connected, IP: %s", address);
-        start_frequency_http_server();
-#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
-        snprintf(s_wifi_ip, sizeof(s_wifi_ip), "%s", address);
-        char response[64];
-        snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", address);
-        ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
-#endif
-        return;
-    }
-
-    /* Without this, a failed join (bad password, AP out of range) leaves the app waiting forever. */
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *event = event_data;
-        printf("WiFi disconnected, reason: %d\n", event->reason);
-#if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
-        s_wifi_ip[0] = '\0';
-        char response[64];
-        snprintf(response, sizeof(response), "ERR WiFi disconnected reason=%d\r\n", event->reason);
-        ble_publish_response(BLE_HS_CONN_HANDLE_NONE, response);
-#endif
-    }
-}
-
-static bool start_wifi_connection(const char *ssid, const char *password, char *response, size_t response_len)
-{
-    if (!wifi_started) {
-        snprintf(response, response_len, "ERR WiFi is not ready\r\n");
-        return false;
-    }
-
-    size_t ssid_len = strlen(ssid);
-    size_t password_len = strlen(password);
-    if (ssid_len == 0 || ssid_len > 32 || password_len < 8 || password_len > 63) {
-        snprintf(response, response_len, "ERR invalid WiFi credentials\r\n");
-        return false;
-    }
-
-    wifi_config_t config = {0};
-    memcpy(config.sta.ssid, ssid, ssid_len);
-    memcpy(config.sta.password, password, password_len);
-    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    /*
-     * ESP-Hosted's netif "started" latch can get stuck false after the STA
-     * was already up once, so a later esp_wifi_connect() associates but
-     * WIFI_EVENT_STA_CONNECTED never reaches esp_netif: DHCP never runs and
-     * no IP ever arrives, with no error either. A stop/start cycle clears
-     * that latch unconditionally before each connect attempt.
-     */
-    esp_wifi_stop();
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (err == ESP_OK) {
-        err = esp_wifi_set_config(WIFI_IF_STA, &config);
-    }
-    if (err == ESP_OK) {
-        err = esp_wifi_start();
-    }
-    if (err == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(300));
-        err = esp_wifi_connect();
-    }
-    if (err != ESP_OK) {
-        snprintf(response, response_len, "ERR WiFi connect failed: %s\r\n", esp_err_to_name(err));
-        return false;
-    }
-
-    snprintf(response, response_len, "OK WiFi connecting\r\n");
-    return true;
-}
-
 #if defined(CONFIG_ESP_HOSTED_ENABLED) && CONFIG_ESP_HOSTED_ENABLED
 static void start_hosted_wifi_link(void)
 {
@@ -2200,18 +2118,10 @@ static void start_hosted_wifi_link(void)
         return;
     }
 
-    /* Without this, the STA associates but never gets a netif/DHCP client, so it never gets an IP. */
-    if (esp_netif_create_default_wifi_sta() == NULL) {
-        ESP_LOGE(TAG, "WiFi STA netif create failed");
-        return;
-    }
     if (esp_netif_create_default_wifi_ap() == NULL) {
         ESP_LOGE(TAG, "WiFi AP netif create failed");
         return;
     }
-
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
@@ -2229,7 +2139,7 @@ static void start_hosted_wifi_link(void)
     };
     esp_wifi_set_country(&country);
 
-    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi set mode failed: %s", esp_err_to_name(err));
         return;
@@ -2242,6 +2152,16 @@ static void start_hosted_wifi_link(void)
     ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap_config.ap.max_connection = 4;
     ap_config.ap.channel = 6;
+    /* Android's WifiNetworkSpecifier (local-only network requests, used by
+     * the phone app to auto-join this AP in the background) is stricter
+     * about PMF/802.11w than a normal Wi-Fi-settings join -- without this,
+     * newer Android versions can silently fail to connect via that API even
+     * though the exact same SSID/password joins fine manually. Advertise
+     * PMF-capable (but not required, for compatibility with anything else
+     * that might connect) rather than leaving it at the ESP-IDF default of
+     * fully disabled. */
+    ap_config.ap.pmf_cfg.capable = true;
+    ap_config.ap.pmf_cfg.required = false;
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi AP config failed: %s", esp_err_to_name(err));
@@ -2261,16 +2181,14 @@ static void start_hosted_wifi_link(void)
         ESP_LOGW(TAG, "WiFi TX power limit failed: %s", esp_err_to_name(err));
     }
 
-    wifi_started = true;
     ESP_LOGI(TAG, "Hosted radio link is up (P4 host, C6 co-processor).");
 
-    /* The AP is live immediately (no "joining" step, unlike STA) -- treat the
-     * board as reachable right away instead of waiting for a STA DHCP lease
-     * that may never come if no home Wi-Fi is configured/in range. */
+    /* The AP is live immediately -- the board is AP-only, so this is the
+     * only Wi-Fi readiness signal there is. */
     ESP_LOGI(TAG, "SoftAP up: ssid=%s ip=%s", WIFI_AP_SSID, WIFI_AP_IP);
     start_frequency_http_server();
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
-    snprintf(s_wifi_ip, sizeof(s_wifi_ip), "%s", WIFI_AP_IP);
+    s_wifi_ready = true;
     char ap_response[64];
     snprintf(ap_response, sizeof(ap_response), "WiFi connected ip=%s\r\n", WIFI_AP_IP);
     ble_publish_response(BLE_HS_CONN_HANDLE_NONE, ap_response);
@@ -2287,7 +2205,6 @@ static void start_hosted_wifi_link(void)
 #define BLE_COMPANION_SERVICE_UUID 0xFFF0
 #define BLE_COMPANION_CHAR_UUID    0xFFF1
 #define BLE_RESPONSE_CHAR_UUID     0xFFF2
-#define BLE_WIFI_CONFIG_CHAR_UUID  0xFFF3
 
 static uint8_t s_ble_addr_type = 0;
 static uint16_t s_ble_response_handle;
@@ -2325,30 +2242,6 @@ static void ble_publish_response(uint16_t conn_handle, const char *message)
     if (rc != 0) {
         printf("BLE response notify not sent: rc=%d\n", rc);
     }
-}
-
-static int ble_wifi_config_write_cb(uint16_t conn_handle, uint16_t attr_handle,
-                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
-{
-    (void)attr_handle;
-    (void)arg;
-    char credentials[98] = {0};
-    uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
-    if (length >= sizeof(credentials) || ble_hs_mbuf_to_flat(ctxt->om, credentials, length, NULL) != 0) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    credentials[length] = '\0';
-
-    char *password = strchr(credentials, '\n');
-    char response[96];
-    if (password == NULL) {
-        snprintf(response, sizeof(response), "ERR WiFi format is ssid\\npassword\r\n");
-    } else {
-        *password++ = '\0';
-        start_wifi_connection(credentials, password, response, sizeof(response));
-    }
-    ble_publish_response(conn_handle, response);
-    return 0;
 }
 
 static int ble_freq_write_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -2392,11 +2285,6 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .val_handle = &s_ble_response_handle,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
-            {
-                .uuid = BLE_UUID16_DECLARE(BLE_WIFI_CONFIG_CHAR_UUID),
-                .access_cb = ble_wifi_config_write_cb,
-                .flags = BLE_GATT_CHR_F_WRITE,
-            },
             {0},
         },
     },
@@ -2414,17 +2302,14 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     } else if (event->type == BLE_GAP_EVENT_SUBSCRIBE) {
         /* Fires when the phone app finishes subscribing to notifications on the
          * response characteristic, right after every BLE (re)connect. The board's
-         * one-shot "WiFi connected ip=..." notify (sent once, at boot-time Wi-Fi
-         * join) is otherwise missed whenever the app wasn't already subscribed at
-         * that moment -- which is the common case, since the board auto-reconnects
-         * to saved Wi-Fi credentials on its own well before a phone re-pairs.
-         * Resending the cached IP here means the app learns it on every connect
-         * without the user having to re-enter Wi-Fi credentials just to discover
-         * an IP the board already has. */
+         * one-shot "WiFi connected ip=..." notify (sent once, at AP startup) is
+         * otherwise missed whenever the app wasn't already subscribed at that
+         * moment. Resending it here means the app learns the (always-fixed)
+         * AP IP on every connect. */
         if (event->subscribe.attr_handle == s_ble_response_handle &&
-            event->subscribe.cur_notify && s_wifi_ip[0] != '\0') {
+            event->subscribe.cur_notify && s_wifi_ready) {
             char response[64];
-            snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", s_wifi_ip);
+            snprintf(response, sizeof(response), "WiFi connected ip=%s\r\n", WIFI_AP_IP);
             ble_publish_response(event->subscribe.conn_handle, response);
         }
     }
