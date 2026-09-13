@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -201,6 +202,37 @@ typedef struct {
 static dtc_state_t s_dtc_state;
 static portMUX_TYPE s_dtc_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_dtc_clear_requested;
+
+/* Mode 09 PID 0x02 (VIN) is a one-off read, not something worth polling --
+ * unlike engine PIDs the VIN never changes, so it's requested on demand via
+ * POST /api/obd/vin and cached here for GET /api/obd/vin to return. */
+typedef struct {
+    char vin[18]; /* 17 VIN characters + null terminator */
+    const char *status; /* "none" | "ok" | "timeout" | "error" (passive mode) */
+} vin_state_t;
+
+static vin_state_t s_vin_state = { .vin = "", .status = "none" };
+static portMUX_TYPE s_vin_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_vin_requested;
+
+/* Firmware OTA: the phone app pushes a new image over the board's own
+ * Wi-Fi link (POST /api/ota) instead of needing a USB/PC visit for every
+ * fix -- see partitions.csv for the two-app-slot layout this needs.
+ * ota_http_handler runs on the httpd server's single worker task, so this
+ * plain (non-atomic) state is safe without a lock the same way s_ble_response
+ * and other handler-local state elsewhere in this file are. */
+typedef enum {
+    OTA_STATE_IDLE,
+    OTA_STATE_RECEIVING,
+    OTA_STATE_SUCCESS,
+    OTA_STATE_FAILED,
+} ota_state_t;
+
+static ota_state_t s_ota_state = OTA_STATE_IDLE;
+static size_t s_ota_bytes_written;
+/* Generous headroom under partitions.csv's 0x180000-byte OTA slots -- rejects
+ * an oversized upload up front instead of discovering the overflow mid-write. */
+#define OTA_MAX_IMAGE_SIZE (0x180000 - 0x1000)
 
 typedef struct {
     uint16_t raw;
@@ -1091,6 +1123,89 @@ static void obd_query_dtcs(void)
     }
 }
 
+/* Sends Mode 09 PID 0x02 (VIN) as a functional broadcast and decodes the
+ * first valid reply, if the CAN bridge is active. Same "flag raised by an
+ * HTTP handler, serviced from obd_query_task so it shares the single
+ * in-flight request/response slot" pattern as
+ * obd_query_clear_dtcs_if_requested. Deliberately does NOT filter by the
+ * Mode 01 responder-lock id used in the PID polling loop below: VIN is
+ * commonly answered by a different physical ECU (e.g. the gateway) than the
+ * one that answers engine PIDs, and this is a one-shot read rather than a
+ * continuous poll where a wrong-ECU answer could masquerade as frozen live
+ * data the way it did for RPM/Speed. */
+static void obd_query_vin_if_requested(void)
+{
+    if (!s_vin_requested) {
+        return;
+    }
+    s_vin_requested = false;
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "VIN read requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_vin_lock);
+        s_vin_state.vin[0] = '\0';
+        s_vin_state.status = "error";
+        portEXIT_CRITICAL(&s_vin_lock);
+        return;
+    }
+
+    uint8_t request[8] = { 0x02, 0x09, 0x02, 0, 0, 0, 0, 0 };
+    s_obd_request_pending = true;
+    obd_send_request(request, sizeof(request));
+
+    char vin[18] = {0};
+    bool ok = false;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_MULTI_ECU_WINDOW_MS * 1000);
+
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        obd_frame_t response;
+        if (!xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(remaining_ms))) {
+            break;
+        }
+        uint8_t payload[ISOTP_MAX_PAYLOAD];
+        uint8_t payload_len = 0;
+        if (!isotp_reassemble(response.id, &response, payload, &payload_len, deadline_us)) {
+            continue;
+        }
+        if (payload_len < 3 || payload[0] != 0x49 || payload[1] != 0x02) {
+            continue; /* not a Mode 09 PID 0x02 reply -- some other response interleaved */
+        }
+        /* payload[2] is NODI (number of data items, normally 1); the VIN's
+         * up to 17 ASCII characters follow starting at payload[3]. Restrict
+         * to alphanumerics (real VINs are always alnum, no I/O/Q but any
+         * alnum is accepted here) so a garbled/short response can't inject
+         * a stray quote or backslash into the hand-built JSON response. */
+        uint8_t vin_len = payload_len - 3;
+        if (vin_len > 17) {
+            vin_len = 17;
+        }
+        for (uint8_t i = 0; i < vin_len; i++) {
+            char c = (char)payload[3 + i];
+            vin[i] = isalnum((unsigned char)c) ? c : '?';
+        }
+        vin[vin_len] = '\0';
+        ok = (vin_len > 0);
+        break;
+    }
+    s_obd_request_pending = false;
+
+    portENTER_CRITICAL(&s_vin_lock);
+    if (ok) {
+        snprintf(s_vin_state.vin, sizeof(s_vin_state.vin), "%s", vin);
+        s_vin_state.status = "ok";
+    } else {
+        s_vin_state.vin[0] = '\0';
+        s_vin_state.status = "timeout";
+    }
+    portEXIT_CRITICAL(&s_vin_lock);
+
+    ESP_LOGI(TAG, "VIN read -> %s", ok ? vin : "no response (timeout)");
+}
+
 /* Acts as a minimal scan tool: requests each supported PID in turn on the
  * broadcast functional ID, waits for the ECU's 0x7E8 reply, and prints it. */
 static void obd_query_task(void *arg)
@@ -1105,6 +1220,7 @@ static void obd_query_task(void *arg)
 
     while (1) {
         obd_query_clear_dtcs_if_requested();
+        obd_query_vin_if_requested();
 
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
             if (s_can_passive) {
@@ -1751,6 +1867,158 @@ static esp_err_t dtc_clear_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Returns the last VIN read (if any) -- status is "none" until a read has
+ * ever been requested, "ok"/"timeout"/"error" afterward. Doesn't trigger a
+ * new read itself; see vin_read_http_handler for that. */
+static esp_err_t vin_http_handler(httpd_req_t *request)
+{
+    char vin[18];
+    const char *status;
+    portENTER_CRITICAL(&s_vin_lock);
+    snprintf(vin, sizeof(vin), "%s", s_vin_state.vin);
+    status = s_vin_state.status;
+    portEXIT_CRITICAL(&s_vin_lock);
+
+    char response[48];
+    snprintf(response, sizeof(response), "{\"vin\":\"%s\",\"status\":\"%s\"}", vin, status);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Actual read happens in obd_query_task (obd_query_vin_if_requested), which
+ * owns the single in-flight OBD request/response slot; this handler just
+ * raises the request flag and returns immediately, same as
+ * dtc_clear_http_handler. The app polls GET /api/obd/vin afterward for the
+ * result. */
+static esp_err_t vin_read_http_handler(httpd_req_t *request)
+{
+    s_vin_requested = true;
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"vin read requested\"}");
+    return ESP_OK;
+}
+
+static esp_err_t ota_status_http_handler(httpd_req_t *request)
+{
+    const char *state_str;
+    switch (s_ota_state) {
+        case OTA_STATE_RECEIVING: state_str = "receiving"; break;
+        case OTA_STATE_SUCCESS: state_str = "success"; break;
+        case OTA_STATE_FAILED: state_str = "failed"; break;
+        default: state_str = "idle"; break;
+    }
+    /* Which app slot is actually running right now -- toggles between ota_0
+     * and ota_1 on every successful update, so the app can confirm a push
+     * really took effect (rather than just trusting the reboot happened). */
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    char response[128];
+    snprintf(response, sizeof(response), "{\"state\":\"%s\",\"bytes_written\":%u,\"running_partition\":\"%s\"}",
+             state_str, (unsigned)s_ota_bytes_written, running != NULL ? running->label : "unknown");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Streams the POST body straight into the inactive OTA app partition and,
+ * once fully received and validated, sets it as the boot partition and
+ * reboots into it. CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE means a new image
+ * that fails to get through app_main's rollback-cancel call (e.g. it
+ * crash-loops) gets automatically rolled back to the previous image by the
+ * bootloader -- the safety net that makes pushing firmware from the car,
+ * away from USB/JTAG, an acceptable risk. */
+static esp_err_t ota_http_handler(httpd_req_t *request)
+{
+    if (request->content_len == 0 || request->content_len > OTA_MAX_IMAGE_SIZE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid or oversized image");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, request->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    s_ota_state = OTA_STATE_RECEIVING;
+    s_ota_bytes_written = 0;
+    ESP_LOGI(TAG, "OTA update starting: %u bytes -> partition %s", (unsigned)request->content_len, update_partition->label);
+
+    /* Static, not stack-local: this handler already shares the httpd task's
+     * stack with can_capture_http_handler's own large local buffer (see
+     * config.stack_size's comment at server startup) -- adding another 2KB
+     * on the stack on top of that is avoidable by putting this one in .bss
+     * instead, same trick used nowhere else in this file only because
+     * nothing else needed a buffer this large. */
+    static uint8_t buffer[2048];
+    size_t remaining = request->content_len;
+    bool failed = false;
+    while (remaining > 0) {
+        size_t to_read = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        int received = httpd_req_recv(request, (char *)buffer, to_read);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue; /* retry, same as other handlers reading a body */
+        }
+        if (received <= 0) {
+            failed = true;
+            break;
+        }
+        err = esp_ota_write(ota_handle, buffer, (size_t)received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA write failed: %s", esp_err_to_name(err));
+            failed = true;
+            break;
+        }
+        s_ota_bytes_written += (size_t)received;
+        remaining -= (size_t)received;
+    }
+
+    if (failed) {
+        esp_ota_abort(ota_handle);
+        s_ota_state = OTA_STATE_FAILED;
+        ESP_LOGW(TAG, "OTA transfer failed after %u bytes", (unsigned)s_ota_bytes_written);
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA transfer failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA end failed (image validation): %s", esp_err_to_name(err));
+        s_ota_state = OTA_STATE_FAILED;
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Image validation failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA set boot partition failed: %s", esp_err_to_name(err));
+        s_ota_state = OTA_STATE_FAILED;
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Set boot partition failed");
+        return ESP_FAIL;
+    }
+
+    s_ota_state = OTA_STATE_SUCCESS;
+    ESP_LOGI(TAG, "OTA update written (%u bytes) -> %s, rebooting", (unsigned)s_ota_bytes_written, update_partition->label);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"ok, rebooting\"}");
+
+    /* Let the response actually go out over Wi-Fi before the reboot tears
+     * down the network stack -- there's nothing to poll afterward the way
+     * other "acknowledge then act asynchronously" flows in this file allow,
+     * so this one blocks briefly instead. */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK; /* unreached */
+}
+
 /* Sends the private fault-injection CAN frame straight from this HTTP
  * handler's own task (mcp2515_send is SPI-mutex protected, so this is safe
  * to call concurrently with obd_query_task/can_echo_task) rather than
@@ -2053,7 +2321,7 @@ static void start_frequency_http_server(void)
      * can_partner, can_sim_mode). Without raising this, registrations past
      * the 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of
      * crashing, which is a much harder bug to notice -- endpoints just 404. */
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 18;
     /* Default stack_size is 4096. can_capture_http_handler's local
      * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
      * the entire default stack, with nothing left for anything else in that
@@ -2119,6 +2387,26 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = can_sim_mode_http_handler,
     };
+    httpd_uri_t vin_uri = {
+        .uri = "/api/obd/vin",
+        .method = HTTP_GET,
+        .handler = vin_http_handler,
+    };
+    httpd_uri_t vin_read_uri = {
+        .uri = "/api/obd/vin",
+        .method = HTTP_POST,
+        .handler = vin_read_http_handler,
+    };
+    httpd_uri_t ota_status_uri = {
+        .uri = "/api/ota",
+        .method = HTTP_GET,
+        .handler = ota_status_http_handler,
+    };
+    httpd_uri_t ota_uri = {
+        .uri = "/api/ota",
+        .method = HTTP_POST,
+        .handler = ota_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -2133,6 +2421,10 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &tasks_uri);
         httpd_register_uri_handler(http_server, &can_partner_uri);
         httpd_register_uri_handler(http_server, &can_sim_mode_uri);
+        httpd_register_uri_handler(http_server, &vin_uri);
+        httpd_register_uri_handler(http_server, &vin_read_uri);
+        httpd_register_uri_handler(http_server, &ota_status_uri);
+        httpd_register_uri_handler(http_server, &ota_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
@@ -2142,6 +2434,8 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "Tasks API ready: GET /api/tasks");
         ESP_LOGI(TAG, "DTC API ready: GET /api/dtc, POST /api/dtc/clear, POST /api/dtc/simulate");
         ESP_LOGI(TAG, "CAN partner API ready: GET /api/can/partner, POST /api/can/sim_mode");
+        ESP_LOGI(TAG, "VIN API ready: GET /api/obd/vin, POST /api/obd/vin");
+        ESP_LOGI(TAG, "OTA API ready: GET /api/ota (status), POST /api/ota (push new firmware image)");
     }
 }
 
@@ -2455,6 +2749,23 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    /* If this boot is into a freshly OTA-pushed image (ota_http_handler),
+     * the bootloader marks it "pending verify" and will roll back to the
+     * previous image on the NEXT boot unless something here confirms it's
+     * good first. Getting this far without crashing is treated as
+     * sufficient confirmation for this app (no deeper self-test) -- the
+     * whole point of CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is a safety net
+     * for a bad push made away from USB/JTAG, not a replacement for testing
+     * before pushing. */
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_img_state;
+    if (running_partition != NULL &&
+        esp_ota_get_state_partition(running_partition, &ota_img_state) == ESP_OK &&
+        ota_img_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "OTA image on partition %s marked valid; rollback canceled", running_partition->label);
+    }
 
     init_led();
     esp_log_level_set(TAG, s_log_level);
