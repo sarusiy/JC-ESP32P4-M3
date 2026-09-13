@@ -172,6 +172,14 @@ static esp_log_level_t s_log_level = ESP_LOG_INFO;
 
 typedef struct {
     uint32_t supported_pids;
+    /* PIDs 0x21-0x40's own support bitmask (Mode 01 PID 0x20's response) --
+     * PID 0x00's bitmask has its top bit-set-at-0x20 convention meaning
+     * "there's a further page", which this car's does (see
+     * PID_SUPPORT_ANALYSIS.md) -- queried but not yet decoded into specific
+     * named fields since which of 0x21-0x40 this car actually supports
+     * hasn't been confirmed yet; raw value exposed via the API so it can be
+     * inspected/decoded next time a real car is connected. */
+    uint32_t supported_pids_2;
     int coolant_c;
     uint16_t rpm;
     uint8_t speed_kmh;
@@ -721,6 +729,17 @@ static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
                 ESP_LOGI(TAG, "OBD PID 0x11 (throttle position) -> %u %%", (buf[3] * 100u) / 255u);
             }
             break;
+        case 0x20:
+            if (len >= 7) {
+                uint32_t bitmask = ((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16) |
+                                    ((uint32_t)buf[5] << 8) | buf[6];
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.supported_pids_2 = bitmask;
+                portEXIT_CRITICAL(&s_obd_lock);
+                ESP_LOGI(TAG, "OBD PID 0x20 (supported PIDs 21-40) -> bitmask %02x %02x %02x %02x",
+                         buf[3], buf[4], buf[5], buf[6]);
+            }
+            break;
         default:
             ESP_LOGI(TAG, "OBD PID 0x%02x -> unrecognized response", pid);
             break;
@@ -1077,7 +1096,7 @@ static void obd_query_dtcs(void)
 static void obd_query_task(void *arg)
 {
     (void)arg;
-    static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11 };
+    static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11, 0x20 };
     uint8_t consecutive_timeouts = 0;
 
     while (1) {
@@ -1647,11 +1666,11 @@ static esp_err_t obd_http_handler(httpd_req_t *request)
     portENTER_CRITICAL(&s_obd_lock);
     state = s_obd_state;
     portEXIT_CRITICAL(&s_obd_lock);
-    char response[192];
+    char response[224];
     snprintf(response, sizeof(response),
-             "{\"supported_pids\":\"%08lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
-             (unsigned long)state.supported_pids, state.coolant_c,
-             state.rpm, state.speed_kmh, state.throttle_pct);
+             "{\"supported_pids\":\"%08lx\",\"supported_pids_2\":\"%08lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
+             (unsigned long)state.supported_pids, (unsigned long)state.supported_pids_2,
+             state.coolant_c, state.rpm, state.speed_kmh, state.throttle_pct);
     httpd_resp_set_type(request, "application/json");
     httpd_resp_sendstr(request, response);
     return ESP_OK;

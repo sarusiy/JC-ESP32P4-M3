@@ -20,3 +20,7 @@ dependencies.lock
 
 # Large binary docs (multi-GB workshop manuals); keep local only, too big for GitHub.
 Doc/**/*.zip
+
+# Raw CAN capture data pulled from the phone for offline analysis; local
+# working data, not source -- keep it on disk, out of the repo.
+captures/
