@@ -1,0 +1,41 @@
+# Eagle / Fusion Electronics script -- places the 6 resistors for the 3
+# 10K/15K dividers (MISO, INT, GPS RX) discussed in gps_uart_wiring.svg.
+#
+# HOW TO RUN:
+#   In the Schematic editor: File > Run Script... (or Execute Script),
+#   select this file.
+#
+# WHAT THIS DOES: adds 6 resistor parts and sets their values, laid out in
+# 3 columns of 2 (one column per divider). Does NOT wire them -- connect
+# each column's two resistors in series, with a net label at the junction,
+# and the top resistor's other end going to its labeled source net, and the
+# bottom resistor's other end going to GND. See gps_uart_wiring.svg and the
+# earlier chat message for the exact net names per divider.
+#
+# CAVEAT: 'R@resistor.lbr' assumes a library named resistor.lbr with a
+# device named R is available -- this is common in Eagle/Fusion's default
+# libraries but NOT guaranteed for your specific install. If any ADD command
+# below fails/errors, that means your library setup differs: instead, use
+# the part search in Fusion's UI (search "RESISTOR"), place it manually
+# where you want it, then you can still run just the matching VALUE line
+# below (e.g. "VALUE R1 '10K';") once the part is named R1.
+
+GRID MM;
+
+# --- Divider 1: MISO (MCP2515 SO, 5V) -> P4 GPIO52 ---
+ADD R@resistor.lbr R1 (10 90);
+VALUE R1 '10K';
+ADD R@resistor.lbr R2 (10 70);
+VALUE R2 '15K';
+
+# --- Divider 2: INT (MCP2515 INT, 5V) -> P4 GPIO29 ---
+ADD R@resistor.lbr R3 (50 90);
+VALUE R3 '10K';
+ADD R@resistor.lbr R4 (50 70);
+VALUE R4 '15K';
+
+# --- Divider 3: GPS RX (Arduino D3, 5V) -> P4 GPIO34 ---
+ADD R@resistor.lbr R5 (90 90);
+VALUE R5 '10K';
+ADD R@resistor.lbr R6 (90 70);
+VALUE R6 '15K';
