@@ -513,6 +513,38 @@ static uds_scan_t s_uds_scan;
 static portMUX_TYPE s_uds_scan_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_uds_scan_requested;
 
+/* Address-discovery sweep: rather than probing DIDs on one known-address
+ * module, probes *addresses* themselves with a single Diagnostic Session
+ * Control request each, to find which physical modules actually answer on
+ * this car -- see UDS_BODY_MODULE_RESEARCH.md's 2026-09-15 Gateway test
+ * (session:positive, proving the request mechanism itself works; the
+ * follow-up question is which addresses are real on this specific car,
+ * not whether our code can talk UDS at all). Every candidate address pair
+ * researched so far shares the same response = request + 0x6A offset, so
+ * this only needs to sweep request IDs, not enumerate pairs. */
+#define UDS_ADDR_SCAN_MAX_RESULTS 32
+#define UDS_ADDR_SCAN_MAX_RANGE 256
+
+typedef struct {
+    uint32_t request_id;
+    uds_session_state_t session_state; /* only POSITIVE/NEGATIVE stored -- a hit either way */
+} uds_addr_scan_result_t;
+
+typedef struct {
+    uint32_t req_start;
+    uint32_t req_end;
+    uint32_t response_offset;
+    bool extended;
+    uds_scan_state_t state;
+    uint32_t current_req; /* progress indicator while running */
+    uint8_t result_count;
+    uds_addr_scan_result_t results[UDS_ADDR_SCAN_MAX_RESULTS];
+} uds_addr_scan_t;
+
+static uds_addr_scan_t s_uds_addr_scan;
+static portMUX_TYPE s_uds_addr_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_uds_addr_scan_requested;
+
 /* Which OBD-II addressing scheme has actually gotten a response so far.
  * UNKNOWN means "haven't heard back on either scheme yet" -- obd_send_request
  * probes both in that state; once one responds, every later query sticks to
@@ -1419,6 +1451,70 @@ static void obd_query_uds_scan_if_requested(void)
     ESP_LOGI(TAG, "UDS scan complete: %u DID(s) responded", (unsigned)s_uds_scan.result_count);
 }
 
+/* Services a UDS address-discovery sweep set up by
+ * uds_addr_scan_start_http_handler: sends one Diagnostic Session Control
+ * request per candidate request ID in the range, recording any address
+ * that gets a real response (positive or negative -- either means a live
+ * module is actually listening there, unlike a timeout). Same in-flight-
+ * request-slot sharing and pacing as the DID sweep above. */
+static void obd_query_uds_addr_scan_if_requested(void)
+{
+    if (!s_uds_addr_scan_requested) {
+        return;
+    }
+    s_uds_addr_scan_requested = false;
+
+    uint32_t req_start, req_end, response_offset;
+    bool extended;
+    portENTER_CRITICAL(&s_uds_addr_scan_lock);
+    req_start = s_uds_addr_scan.req_start;
+    req_end = s_uds_addr_scan.req_end;
+    response_offset = s_uds_addr_scan.response_offset;
+    extended = s_uds_addr_scan.extended;
+    portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "UDS address scan requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_uds_addr_scan_lock);
+        s_uds_addr_scan.state = UDS_SCAN_ERROR;
+        portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+        return;
+    }
+
+    ESP_LOGI(TAG, "UDS address scan starting: req=0x%lx-0x%lx offset=0x%lx",
+             (unsigned long)req_start, (unsigned long)req_end, (unsigned long)response_offset);
+
+    for (uint32_t req_id = req_start; req_id <= req_end; req_id++) {
+        portENTER_CRITICAL(&s_uds_addr_scan_lock);
+        s_uds_addr_scan.current_req = req_id;
+        portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+
+        uint32_t resp_id = req_id + response_offset;
+        uds_session_state_t session_state = uds_start_session(req_id, resp_id, extended);
+
+        if (session_state != UDS_SESSION_TIMEOUT) {
+            portENTER_CRITICAL(&s_uds_addr_scan_lock);
+            if (s_uds_addr_scan.result_count < UDS_ADDR_SCAN_MAX_RESULTS) {
+                uds_addr_scan_result_t *result = &s_uds_addr_scan.results[s_uds_addr_scan.result_count++];
+                result->request_id = req_id;
+                result->session_state = session_state;
+            }
+            portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+            ESP_LOGI(TAG, "UDS address scan: 0x%lx -> %s", (unsigned long)req_id,
+                     session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+        } else {
+            ESP_LOGD(TAG, "UDS address scan: 0x%lx -> timeout", (unsigned long)req_id);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+    }
+
+    portENTER_CRITICAL(&s_uds_addr_scan_lock);
+    s_uds_addr_scan.state = UDS_SCAN_DONE;
+    portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+    ESP_LOGI(TAG, "UDS address scan complete: %u address(es) responded", (unsigned)s_uds_addr_scan.result_count);
+}
+
 /* Acts as a minimal scan tool: requests each supported PID in turn on the
  * broadcast functional ID, waits for the ECU's 0x7E8 reply, and prints it. */
 static void obd_query_task(void *arg)
@@ -1435,6 +1531,7 @@ static void obd_query_task(void *arg)
         obd_query_clear_dtcs_if_requested();
         obd_query_vin_if_requested();
         obd_query_uds_scan_if_requested();
+        obd_query_uds_addr_scan_if_requested();
 
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
             if (s_can_passive) {
@@ -2208,6 +2305,87 @@ static esp_err_t uds_scan_status_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Kicks off a UDS address-discovery sweep -- see
+ * UDS_BODY_MODULE_RESEARCH.md's 2026-09-15 update. Body (plain text):
+ * "req_start,req_end,offset,extended" -- req_start/req_end/offset in hex
+ * without a 0x prefix, extended is 0 or 1, e.g. "700,7FF,6A,0" to probe
+ * every address 0x700-0x7FF with response = request + 0x6A. */
+static esp_err_t uds_addr_scan_start_http_handler(httpd_req_t *request)
+{
+    char body[48] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected req_start,req_end,offset,extended");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    unsigned long req_start = 0, req_end = 0, offset = 0, extended = 0;
+    if (sscanf(body, "%lx,%lx,%lx,%lu", &req_start, &req_end, &offset, &extended) != 4) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                             "Expected req_start,req_end,offset,extended (hex,hex,hex,0|1)");
+        return ESP_FAIL;
+    }
+    if (req_end < req_start || (req_end - req_start + 1) > UDS_ADDR_SCAN_MAX_RANGE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Address range invalid or too large (max 256)");
+        return ESP_FAIL;
+    }
+
+    portENTER_CRITICAL(&s_uds_addr_scan_lock);
+    s_uds_addr_scan.req_start = (uint32_t)req_start;
+    s_uds_addr_scan.req_end = (uint32_t)req_end;
+    s_uds_addr_scan.response_offset = (uint32_t)offset;
+    s_uds_addr_scan.extended = extended != 0;
+    s_uds_addr_scan.current_req = (uint32_t)req_start;
+    s_uds_addr_scan.result_count = 0;
+    s_uds_addr_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+    s_uds_addr_scan_requested = true;
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"uds address scan requested\"}");
+    return ESP_OK;
+}
+
+/* Returns current progress/results of the last (or in-progress) UDS
+ * address-discovery sweep. */
+static esp_err_t uds_addr_scan_status_http_handler(httpd_req_t *request)
+{
+    uds_addr_scan_t snapshot;
+    portENTER_CRITICAL(&s_uds_addr_scan_lock);
+    snapshot = s_uds_addr_scan;
+    portEXIT_CRITICAL(&s_uds_addr_scan_lock);
+
+    const char *state_str;
+    switch (snapshot.state) {
+        case UDS_SCAN_RUNNING: state_str = "running"; break;
+        case UDS_SCAN_DONE: state_str = "done"; break;
+        case UDS_SCAN_ERROR: state_str = "error"; break;
+        default: state_str = "idle"; break;
+    }
+
+    /* Sized for UDS_ADDR_SCAN_MAX_RESULTS entries at up to ~48 bytes of JSON each. */
+    static char response[UDS_ADDR_SCAN_MAX_RESULTS * 48 + 128];
+    int written = snprintf(response, sizeof(response),
+            "{\"state\":\"%s\",\"current_req\":\"0x%03lx\",\"result_count\":%u,\"results\":[",
+            state_str, (unsigned long)snapshot.current_req, snapshot.result_count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < snapshot.result_count && used < sizeof(response); i++) {
+        written = snprintf(response + used, sizeof(response) - used,
+                "%s{\"req\":\"0x%03lx\",\"session\":\"%s\"}",
+                i == 0 ? "" : ",", (unsigned long)snapshot.results[i].request_id,
+                snapshot.results[i].session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static esp_err_t ota_status_http_handler(httpd_req_t *request)
 {
     const char *state_str;
@@ -2625,12 +2803,14 @@ static void start_frequency_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* Default max_uri_handlers is 8; we now register 12 (frequency, obd,
+    /* Default max_uri_handlers is 8; we now register 20 (frequency, obd,
      * can_capture, can_mode, gps, health, tasks, dtc, dtc_clear, dtc_simulate,
-     * can_partner, can_sim_mode). Without raising this, registrations past
-     * the 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of
-     * crashing, which is a much harder bug to notice -- endpoints just 404. */
-    config.max_uri_handlers = 20;
+     * can_partner, can_sim_mode, vin, vin_read, ota_status, ota,
+     * uds_scan_status, uds_scan_start, uds_addr_scan_status,
+     * uds_addr_scan_start). Without raising this, registrations past the
+     * 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of crashing,
+     * which is a much harder bug to notice -- endpoints just 404. */
+    config.max_uri_handlers = 24;
     /* Default stack_size is 4096. can_capture_http_handler's local
      * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
      * the entire default stack, with nothing left for anything else in that
@@ -2726,6 +2906,16 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = uds_scan_start_http_handler,
     };
+    httpd_uri_t uds_addr_scan_status_uri = {
+        .uri = "/api/uds/addrscan",
+        .method = HTTP_GET,
+        .handler = uds_addr_scan_status_http_handler,
+    };
+    httpd_uri_t uds_addr_scan_start_uri = {
+        .uri = "/api/uds/addrscan",
+        .method = HTTP_POST,
+        .handler = uds_addr_scan_start_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -2746,6 +2936,8 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &ota_uri);
         httpd_register_uri_handler(http_server, &uds_scan_status_uri);
         httpd_register_uri_handler(http_server, &uds_scan_start_uri);
+        httpd_register_uri_handler(http_server, &uds_addr_scan_status_uri);
+        httpd_register_uri_handler(http_server, &uds_addr_scan_start_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
@@ -2758,6 +2950,7 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "VIN API ready: GET /api/obd/vin, POST /api/obd/vin");
         ESP_LOGI(TAG, "OTA API ready: GET /api/ota (status), POST /api/ota (push new firmware image)");
         ESP_LOGI(TAG, "UDS scan API ready: GET /api/uds/scan (status/results), POST /api/uds/scan (req,resp,extended,did_start,did_end)");
+        ESP_LOGI(TAG, "UDS address scan API ready: GET /api/uds/addrscan (status/results), POST /api/uds/addrscan (req_start,req_end,offset,extended)");
     }
 }
 
