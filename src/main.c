@@ -483,6 +483,19 @@ typedef struct {
     uint8_t data[8]; /* raw positive-response payload (service+DID+value bytes), truncated to 8 */
 } uds_scan_result_t;
 
+/* Outcome of the one-shot Diagnostic Session Control (0x10 0x03) request
+ * sent before a sweep -- see UDS_BODY_MODULE_RESEARCH.md's 2026-09-15
+ * update. Recorded alongside the sweep results themselves so it's visible
+ * (via the status JSON and the phone app's uds_scan_log_*.csv) whether the
+ * module even acknowledged a session, independent of whether any DID in
+ * the sweep got a positive response. */
+typedef enum {
+    UDS_SESSION_NOT_ATTEMPTED = 0,
+    UDS_SESSION_POSITIVE,
+    UDS_SESSION_NEGATIVE,
+    UDS_SESSION_TIMEOUT,
+} uds_session_state_t;
+
 typedef struct {
     uint32_t request_id;
     uint32_t response_id;
@@ -490,6 +503,7 @@ typedef struct {
     uint16_t did_start;
     uint16_t did_end;
     uds_scan_state_t state;
+    uds_session_state_t session_state;
     uint16_t current_did; /* progress indicator while running */
     uint8_t result_count;
     uds_scan_result_t results[UDS_SCAN_MAX_RESULTS];
@@ -1263,21 +1277,22 @@ static void obd_query_vin_if_requested(void)
     ESP_LOGI(TAG, "VIN read -> %s", ok ? vin : "no response (timeout)");
 }
 
-/* Sends UDS ReadDataByIdentifier (service 0x22) for one DID to a specific
- * module and waits for its response. Point-to-point (exact request/response
- * CAN ID pair, supplied by the caller) rather than obd_send_request's
- * dual-scheme functional broadcast -- see UDS_BODY_MODULE_RESEARCH.md for
- * why body-module UDS doesn't need (or want) that ambiguity-resolution
- * machinery. Reuses isotp_reassemble for multi-frame responses since that
- * logic is generic ISO-TP, not Mode-01-specific. */
-static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extended,
-                          uint16_t did, uint8_t *out_payload, uint8_t *out_len)
+/* Sends one UDS request (already-built ISO-TP single-frame payload) to a
+ * specific module and waits for its response. Point-to-point (exact
+ * request/response CAN ID pair, supplied by the caller) rather than
+ * obd_send_request's dual-scheme functional broadcast -- see
+ * UDS_BODY_MODULE_RESEARCH.md for why body-module UDS doesn't need (or
+ * want) that ambiguity-resolution machinery. Reuses isotp_reassemble for
+ * multi-frame responses since that logic is generic ISO-TP, not
+ * Mode-01-specific. Shared by uds_read_did (service 0x22) and
+ * uds_start_session (service 0x10) below. */
+static bool uds_send_and_receive(uint32_t request_id, uint32_t response_id, bool extended,
+                                  const uint8_t *request, uint8_t request_len,
+                                  uint8_t *out_payload, uint8_t *out_len)
 {
-    uint8_t request[8] = { 0x03, 0x22, (uint8_t)(did >> 8), (uint8_t)did, 0, 0, 0, 0 };
-
     s_uds_expected_response_id = response_id;
     s_uds_request_pending = true;
-    mcp2515_send(request_id, extended, sizeof(request), request);
+    mcp2515_send(request_id, extended, request_len, request);
 
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_RESPONSE_TIMEOUT_MS * 1000);
     obd_frame_t response;
@@ -1287,6 +1302,40 @@ static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extende
         return false;
     }
     return isotp_reassemble(response.id, &response, out_payload, out_len, deadline_us);
+}
+
+/* Sends UDS ReadDataByIdentifier (service 0x22) for one DID to a specific
+ * module and waits for its response. */
+static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extended,
+                          uint16_t did, uint8_t *out_payload, uint8_t *out_len)
+{
+    uint8_t request[8] = { 0x03, 0x22, (uint8_t)(did >> 8), (uint8_t)did, 0, 0, 0, 0 };
+    return uds_send_and_receive(request_id, response_id, extended, request, sizeof(request),
+                                 out_payload, out_len);
+}
+
+/* Sends UDS Diagnostic Session Control (service 0x10, subfunction 0x03 --
+ * "extended diagnostic session") to a target module, since some modules
+ * (and possibly the Gateway's own routing) only expose/forward a fuller
+ * DID set inside a non-default session -- see UDS_BODY_MODULE_RESEARCH.md's
+ * 2026-09-15 update. Positive response is 0x50 0x03 (service+0x40, echoing
+ * the subfunction); anything else, or a timeout, is recorded but does not
+ * block the DID sweep that follows -- worth attempting the sweep either
+ * way, since the session requirement (if any) is unconfirmed per module. */
+static uds_session_state_t uds_start_session(uint32_t request_id, uint32_t response_id, bool extended)
+{
+    uint8_t request[8] = { 0x02, 0x10, 0x03, 0, 0, 0, 0, 0 };
+    uint8_t payload[ISOTP_MAX_PAYLOAD];
+    uint8_t payload_len = 0;
+    bool got = uds_send_and_receive(request_id, response_id, extended, request, sizeof(request),
+                                     payload, &payload_len);
+    if (!got) {
+        return UDS_SESSION_TIMEOUT;
+    }
+    if (payload_len >= 2 && payload[0] == 0x50 && payload[1] == 0x03) {
+        return UDS_SESSION_POSITIVE;
+    }
+    return UDS_SESSION_NEGATIVE;
 }
 
 /* Services a UDS DID-sweep request set up by uds_scan_start_http_handler:
@@ -1326,6 +1375,14 @@ static void obd_query_uds_scan_if_requested(void)
 
     ESP_LOGI(TAG, "UDS scan starting: req=0x%lx resp=0x%lx did=0x%04x-0x%04x",
              (unsigned long)request_id, (unsigned long)response_id, did_start, did_end);
+
+    uds_session_state_t session_state = uds_start_session(request_id, response_id, extended);
+    portENTER_CRITICAL(&s_uds_scan_lock);
+    s_uds_scan.session_state = session_state;
+    portEXIT_CRITICAL(&s_uds_scan_lock);
+    ESP_LOGI(TAG, "UDS scan: session control -> %s",
+             session_state == UDS_SESSION_POSITIVE ? "positive" :
+             session_state == UDS_SESSION_NEGATIVE ? "negative" : "timeout");
 
     for (uint32_t did = did_start; did <= did_end; did++) {
         portENTER_CRITICAL(&s_uds_scan_lock);
@@ -2091,6 +2148,7 @@ static esp_err_t uds_scan_start_http_handler(httpd_req_t *request)
     s_uds_scan.did_end = (uint16_t)did_end;
     s_uds_scan.current_did = (uint16_t)did_start;
     s_uds_scan.result_count = 0;
+    s_uds_scan.session_state = UDS_SESSION_NOT_ATTEMPTED;
     s_uds_scan.state = UDS_SCAN_RUNNING;
     portEXIT_CRITICAL(&s_uds_scan_lock);
     s_uds_scan_requested = true;
@@ -2116,11 +2174,19 @@ static esp_err_t uds_scan_status_http_handler(httpd_req_t *request)
         default: state_str = "idle"; break;
     }
 
+    const char *session_str;
+    switch (snapshot.session_state) {
+        case UDS_SESSION_POSITIVE: session_str = "positive"; break;
+        case UDS_SESSION_NEGATIVE: session_str = "negative"; break;
+        case UDS_SESSION_TIMEOUT: session_str = "timeout"; break;
+        default: session_str = "none"; break;
+    }
+
     /* Sized for UDS_SCAN_MAX_RESULTS entries at up to ~48 bytes of JSON each. */
-    static char response[UDS_SCAN_MAX_RESULTS * 48 + 160];
+    static char response[UDS_SCAN_MAX_RESULTS * 48 + 192];
     int written = snprintf(response, sizeof(response),
-            "{\"state\":\"%s\",\"current_did\":\"0x%04x\",\"result_count\":%u,\"results\":[",
-            state_str, snapshot.current_did, snapshot.result_count);
+            "{\"state\":\"%s\",\"session\":\"%s\",\"current_did\":\"0x%04x\",\"result_count\":%u,\"results\":[",
+            state_str, session_str, snapshot.current_did, snapshot.result_count);
     size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
     for (uint8_t i = 0; i < snapshot.result_count && used < sizeof(response); i++) {
         char hex[17] = {0};

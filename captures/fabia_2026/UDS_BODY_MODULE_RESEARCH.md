@@ -145,6 +145,68 @@ above) toggling lock/unlock -- narrowest, clearest state to correlate
 different). Doors and lights are natural next targets once the mechanism
 is proven against locks.
 
+## Update 2026-09-15 — gateway architecture, and the first real-car test
+
+**First real test (2026-09-14, Learn session)**: swept all 8 candidate
+addresses above (lock/unlock/headlights/high_beam/door_open/door_close
+steps) -- zero responses across the board. This predates the
+`uds_scan_log_*.csv` audit trail (see below), so it's unconfirmed whether
+the scans even fired; that's the first thing to check on the next visit.
+
+Separately, researched how the OBD-II port actually reaches these modules
+at all, since the addresses above are physical (point-to-point), not
+broadcast. Findings:
+
+- VAG's Gateway (**J533**) is what the OBD-II connector's CAN pins
+  actually terminate at -- it bridges several separate physical CAN
+  networks (Drivetrain/Powertrain, Convenience/Comfort, Infotainment,
+  Extended, Discrete), each potentially at a different bit rate. A device
+  on the OBD-II bus that isn't the Gateway itself is, by one
+  reverse-engineer's account, not directly reachable at all
+  ([aep/vag_reverse_engineering](https://github.com/aep/vag_reverse_engineering/blob/master/LOG.md)):
+  *"the only thing reachable from the obd can bus is the can gateway."*
+- Confirms this isn't just a logical separation: reverse-engineering notes
+  for a **VW Polo** (same MQB-A0 platform as this Fabia) document the
+  Comfort/Infotainment CAN bus running at **100 kbit/s**, a separate
+  physical network from the 500 kbit/s diagnostic/drivetrain bus
+  ([P1kachu/talking-with-cars](https://github.com/P1kachu/talking-with-cars/blob/master/notes/vw-polo-r6.txt)).
+- **This does not mean the body modules are unreachable via OBD-II**,
+  though -- VCDS/OBDeleven/ODIS all diagnose and code exactly these
+  modules (door electronics, central locking) through the standard 16-pin
+  connector on this exact platform family, every day, with no special
+  wiring. That only works if the Gateway actively bridges properly-formed
+  diagnostic requests across to the Comfort CAN segment. So: **OBD-II
+  should be sufficient; physical rewiring to a different bus is not
+  indicated** by anything found so far.
+
+**Reframed question**: not "can we reach it," but "why isn't the Gateway
+bridging *our* specific requests." Ranked candidate explanations:
+
+1. **Wrong CAN IDs for this specific model/year** -- the source list
+   (`ConnorHowell/vag-uds-ids`) is ODIS-extracted but not confirmed against
+   a 2026 Fabia specifically. Still the most likely explanation.
+2. **Missing a Diagnostic Session Control (`0x10`) step first** -- some
+   modules (and possibly the Gateway's own routing logic) only forward or
+   answer `ReadDataByIdentifier` inside a non-default session. Evidence is
+   mixed (the aep notes say session control "is not needed... but might be
+   needed for others"), but it's cheap to try and was already flagged as
+   step 3 of the firmware scoping below, just not implemented yet.
+3. **Transport-format mismatch** -- VW has historically used its own
+   wrapper protocol (VW TP 2.0) in places; if our raw ISO-TP framing
+   doesn't match what this gateway generation expects for a given module,
+   it could silently drop the request rather than NRC it.
+4. Less likely: the module genuinely isn't populated/active on this trim.
+
+Sources: [aep/vag_reverse_engineering](https://github.com/aep/vag_reverse_engineering/blob/master/LOG.md),
+[P1kachu/talking-with-cars — vw-polo-r6.txt](https://github.com/P1kachu/talking-with-cars/blob/master/notes/vw-polo-r6.txt),
+[VW J533 (Gateway) Cable — openpilot wiki](https://github.com/commaai/openpilot/wiki/VW-J533-(Gateway)-Cable),
+[The CAN & CAN FD in Volkswagen and Audi Vehicles](https://www.springfieldvw.com/notes/learning/the-can-can-fd-in-volkswagen-and-audi-vehicles/).
+
+**Next step (in progress)**: implement #2 above -- send `0x10 0x03`
+(extended diagnostic session) to the target module once before a DID
+sweep starts, and record whether it got a positive (`0x50`) response,
+negative (`0x7F`), or timeout, alongside the sweep's own results.
+
 ## Open risk / things that could go sideways
 
 - These addresses might simply not respond on this specific 2026 Fabia
