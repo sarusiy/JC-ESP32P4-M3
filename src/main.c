@@ -21,6 +21,7 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
@@ -164,7 +165,7 @@ static httpd_handle_t http_server;
  * always reaches the board the same way, anywhere, with zero setup: join
  * this network. Fixed IP from ESP-IDF's default AP netif is 192.168.4.1. */
 #define WIFI_AP_SSID "CarTheftGuard-P4"
-#define WIFI_AP_PASSWORD "theftguard2026"
+#define WIFI_AP_PASSWORD "&Car1310"
 #define WIFI_AP_IP "192.168.4.1"
 
 static const char *TAG = "main";
@@ -442,7 +443,7 @@ static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
 static uint64_t s_can_capture_sequence;
 static portMUX_TYPE s_can_capture_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_can_rx_task;
-static volatile bool s_can_passive = true;
+static volatile bool s_can_passive = false;
 
 /* True only for the brief window between sending a Mode 01/03/04 request and
  * receiving/timing out its reply. The Arduino simulator also broadcasts PID
@@ -1620,7 +1621,13 @@ static void start_can_bridge(void)
         ESP_LOGE(TAG, "CAN bridge init failed; check MCP2515 wiring/power");
         return;
     }
-    s_can_passive = true;
+    /* Active by default -- Passive listen-only never ACKs frames, which
+     * starves real senders into a continuous retransmit storm that badly
+     * distorts observed CAN traffic (see FABIA_ANALYSIS.md). Active is the
+     * accurate default; Passive stays available as an explicit opt-in via
+     * the app's checkbox for anyone who specifically wants zero bus
+     * interaction. */
+    s_can_passive = false;
 
     /* 16, not 4: a multi-frame DTC response from several ECUs can legitimately
      * queue up many frames in a burst (First Frame + several Consecutive
@@ -2716,9 +2723,15 @@ static esp_err_t health_http_handler(httpd_req_t *request)
     uint32_t flash_free = state.flash_size > state.flash_partitioned
                               ? state.flash_size - state.flash_partitioned
                               : 0;
-    char response[512];
+    /* ESP-IDF auto-populates this from `git describe --always --dirty` at
+     * build time (no manual versioning needed, same idea as the Android
+     * app's git-hash-based versionName) -- this is the only way to
+     * distinguish which firmware build is actually running on the board
+     * after an OTA push, since nothing else in this API surfaces it. */
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    char response[640];
     snprintf(response, sizeof(response),
-             "{\"uptime_s\":%lu,\"restart_reason\":\"%s\"," 
+             "{\"firmware_version\":\"%s\",\"uptime_s\":%lu,\"restart_reason\":\"%s\","
              "\"heap_free\":%u,\"heap_min_free\":%u,"
              "\"internal_free\":%u,\"internal_min_free\":%u,"
              "\"psram_free\":%u,\"psram_min_free\":%u,"
@@ -2728,6 +2741,7 @@ static esp_err_t health_http_handler(httpd_req_t *request)
              "\"busy0_pct\":%lu,\"busy1_pct\":%lu,"
              "\"idle0_delta\":%lu,\"idle1_delta\":%lu,"
              "\"idle0_max_delta\":%lu,\"idle1_max_delta\":%lu}",
+             app_desc->version,
              (unsigned long)state.uptime_s, reset_reason_to_string(state.restart_reason),
              (unsigned int)state.heap_free, (unsigned int)state.heap_min_free,
              (unsigned int)state.internal_free, (unsigned int)state.internal_min_free,
