@@ -235,6 +235,51 @@ then module not populated on this trim) -- no shortcut explanation found,
 still needs the real-car test with session-control logging to make
 progress.
 
+## Update 2026-09-15 (real-car test) — six for six timeouts
+
+First real test of the session-control logging, at the car (session
+folder `Rec0915`, archived to `captures/fabia_2026/20260915_session6_uds/`).
+Six candidate targets tried, DID range mostly a minimal single-DID probe
+(`0x0100`-`0x0100`) except Lock Electronics (full `0x0100`-`0x0200`,
+triggered by the Learn wizard's "Lock" step) -- all via `uds_scan_log_*.csv`:
+
+| Target | Address | Session |
+|---|---|---|
+| Lock Electronics | `0x71E`→`0x788` | **timeout** |
+| Central Convenience | `0x70D`→`0x777` | **timeout** |
+| Driver Door | `0x74A`→`0x7B4` | **timeout** |
+| Headlight Regulation | `0x754`→`0x7BE` | **timeout** |
+| Passenger Door | `0x74B`→`0x7B5` | **timeout** |
+| High Beam Assist | `0x730`→`0x79A` | **timeout** |
+
+All six `completed: true` (the firmware's sweep logic itself works
+correctly -- reached `did_end` every time) and `result_count: 0`. Not one
+of six different physical module addresses produced so much as a session-
+control response.
+
+**This reframes the ranked hypothesis list.** Six-for-six uniform silence
+across independently-addressed modules is a weaker fit for "we guessed
+six wrong addresses" (possible, but the addresses are a coherent,
+internally-consistent set from one ODIS extraction, not six independent
+guesses) and a better fit for something systemic -- either a
+transport/framing mismatch in our own request encoding (hypothesis #3),
+or these body modules genuinely aren't reachable this way on this car at
+all, independent of which specific address is used.
+
+**The decisive remaining test**: the **Gateway itself** (`0x710`→`0x77A`)
+was not tried -- it isn't in `UdsTargets.java` yet (added same day, see
+below). The Gateway is the one node already known to answer *something*
+on this OBD-II connection (it's implicit in the working Mode 01 traffic).
+If the Gateway also times out via this exact scan tool, that's strong
+evidence of a transport/framing bug on our side, not six wrong addresses.
+If it responds (even just to session control) while every body module
+stays silent, that confirms the mechanism works and it's specifically
+about how body-module traffic gets routed/addressed.
+
+Untested: Rear Driver Door (`0x73E`→`0x7A8`), Rear Passenger Door
+(`0x73F`→`0x7A9`) -- lower priority than the Gateway test given the
+uniform pattern so far.
+
 ## Open risk / things that could go sideways
 
 - These addresses might simply not respond on this specific 2026 Fabia
