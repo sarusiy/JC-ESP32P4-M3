@@ -206,6 +206,34 @@ Sources: [aep/vag_reverse_engineering](https://github.com/aep/vag_reverse_engine
 (extended diagnostic session) to the target module once before a DID
 sweep starts, and record whether it got a positive (`0x50`) response,
 negative (`0x7F`), or timeout, alongside the sweep's own results.
+**Done same day** -- firmware now sends this automatically before every
+sweep; result is in the status JSON's `session` field and logged to
+`uds_scan_log_*.csv`. Not yet tested against the real car.
+
+## Update 2026-09-15 (later) — ruled out SFD as the likely cause
+
+Checked whether VAG's **SFD** (Schutz Fahrzeug Diagnose) security gate
+could explain the zero-response result, since it's a well-known VAG
+diagnostic restriction introduced ~MY2020. Per
+[Ross-Tech's own SFD documentation](https://wiki.ross-tech.com/wiki/index.php/SFD)
+(the most authoritative source checked): SFD explicitly does **not**
+interfere with basic reads or diagnostic session control -- it only gates
+*write*-type services (coding, adaptation, basic settings, output tests).
+Since our scan tool only ever sends `0x10` (session control) and `0x22`
+(read), **SFD is very unlikely to be the cause** -- this was a plausible
+single clean explanation and it didn't pan out.
+
+The same page mentions a separate, distinct **"Diagnostic Filter"**
+mechanism that can impose stricter restrictions (possibly forcing
+read-only mode or blocking access more broadly), but doesn't confirm
+whether that produces silent timeouts versus explicit negative responses
+-- a weaker, less-specific lead than SFD was, not pursued further yet.
+
+Net effect: back to the original ranked list above (wrong CAN IDs for
+this specific model/year most likely, then transport-format mismatch,
+then module not populated on this trim) -- no shortcut explanation found,
+still needs the real-car test with session-control logging to make
+progress.
 
 ## Open risk / things that could go sideways
 
