@@ -280,6 +280,56 @@ Untested: Rear Driver Door (`0x73E`→`0x7A8`), Rear Passenger Door
 (`0x73F`→`0x7A9`) -- lower priority than the Gateway test given the
 uniform pattern so far.
 
+## Update 2026-09-15 (later still) — full address sweep completed: only the Gateway answers
+
+First successful **full** address-discovery sweep (earlier attempts at the
+car brownout-reset partway through, see above -- this one ran on stable
+PC USB power). Swept the entire plausible diagnostic range in one pass:
+
+```
+req_start=0x700, req_end=0x7FF, final_current_req=0x7FF, completed=true
+result_count=1, hits: 0x710 (positive)
+```
+
+**All 256 standard UDS addresses (`0x700`-`0x7FF`) probed; exactly one
+responds: the Gateway (`0x710`) itself.** Nothing else -- not the 8
+originally-guessed body-module candidates, not any other address in the
+entire practical range. This is a materially stronger result than the
+earlier six-for-six-timeout finding: it rules out "we just guessed wrong
+addresses" as the explanation, since this covers every plausible address,
+not a curated list.
+
+**Updated conclusion**: body-module UDS access (locks, doors, lights) is
+very likely **not reachable via direct point-to-point CAN addressing on
+this bus segment at all**, on this car, through this connection. The
+Gateway is directly addressable and responds normally; nothing else is.
+Combined with the earlier gateway-architecture research (VAG's Gateway
+bridges separate physical CAN networks -- Drivetrain/Powertrain,
+Convenience/Comfort, Infotainment -- and body modules likely live on one
+of those other segments), the remaining plausible explanations are:
+
+1. **Real diagnostic tools (VCDS/ODIS) reach body modules *through* the
+   Gateway's own routing/session mechanism**, not by addressing them
+   directly on the OBD-visible bus segment -- i.e. the Gateway needs to be
+   told (via some protocol-level addressing within a session opened with
+   *it*, not a separate raw CAN ID per module) to forward/proxy the
+   request to a module on another physical segment. This would need
+   understanding VAG's actual routing protocol (possibly the "VW TP 2.0"
+   wrapper mentioned in the 2026-09-15 gateway-architecture research), not
+   just more address guessing.
+2. Less likely given how clean this result is: the body modules are
+   simply not populated/wired on this car's specific configuration --
+   possible but doesn't fit with these being pretty fundamental functions
+   (locks, lights) on a production 2026 Fabia.
+
+**Practical next step, if pursued further**: research how to open a
+session specifically with the Gateway (`0x710`) that then lets it route a
+`ReadDataByIdentifier` through to another module's logical address, rather
+than continuing to probe raw CAN IDs directly. This is a different kind of
+investigation than anything built so far (protocol-level, not address-
+discovery), and a bigger scope than the current DID-sweep/address-sweep
+tools support.
+
 ## Open risk / things that could go sideways
 
 - These addresses might simply not respond on this specific 2026 Fabia
