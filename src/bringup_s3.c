@@ -37,6 +37,7 @@
 #include "nvs_flash.h"
 #include "led_strip.h"
 #include "driver/twai.h"
+#include "driver/uart.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -56,6 +57,15 @@ static const char *TAG = "bringup";
  * confirmed LED pin (48). */
 #define CAN_TX_GPIO 4
 #define CAN_RX_GPIO 5
+/* ArdunioUsbBridgeToCan's simulated GPS goes out over SoftwareSerial on
+ * the Arduino's pin 3 (GPS_TX_PIN in its main.cpp) at 9600 baud, 5V logic
+ * -- routed through a voltage divider down to 3.3V before reaching here,
+ * since S3 GPIOs aren't 5V-tolerant. TX_GPIO is wired but unused (nothing
+ * needs to transmit back to the simulator's GPS input). */
+#define GPS_TX_GPIO 6
+#define GPS_RX_GPIO 7
+#define GPS_BAUD 9600
+#define GPS_UART_PORT UART_NUM_1
 #define WIFI_AP_SSID "CarTheftGuard-P4"
 #define WIFI_AP_PASSWORD "&Car1310"
 #define WIFI_AP_IP "192.168.4.1"
@@ -247,6 +257,43 @@ static void can_receive_task(void *arg)
     }
 }
 
+/* Reads whatever's on the wire and logs it raw -- deliberately not parsing
+ * NMEA yet, just confirming real bytes (ideally real $GPxxx sentences) are
+ * arriving intact through the voltage divider before writing any GPS
+ * protocol logic. */
+static void gps_receive_task(void *arg)
+{
+    (void)arg;
+    uint8_t buf[128];
+    while (1) {
+        int len = uart_read_bytes(GPS_UART_PORT, buf, sizeof(buf) - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            buf[len] = '\0';
+            ESP_LOGI(TAG, "GPS RX (%d bytes): %s", len, (char *)buf);
+        } else {
+            ESP_LOGI(TAG, "GPS RX: nothing in the last second");
+        }
+    }
+}
+
+static void start_gps(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = GPS_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_PORT, 1024, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(GPS_UART_PORT, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_PORT, GPS_TX_GPIO, GPS_RX_GPIO,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_LOGI(TAG, "GPS UART ready: TX=GPIO%d RX=GPIO%d %d baud", GPS_TX_GPIO, GPS_RX_GPIO, GPS_BAUD);
+    xTaskCreate(gps_receive_task, "gps_rx", 4096, NULL, 5, NULL);
+}
+
 static void start_can(void)
 {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
@@ -308,6 +355,7 @@ void app_main(void)
     start_wifi_ap();
     start_ble();
     start_can();
+    start_gps();
 
     ESP_LOGI(TAG, "Blinking LED at the app-controlled rate (default %lu ms half-period) -- "
              "connect with the CarTheftGuard app and adjust it from the Control tab.",

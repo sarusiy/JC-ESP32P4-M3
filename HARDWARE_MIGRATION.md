@@ -244,6 +244,23 @@ reconsidering migrating to the new `esp_twai.h` API for the real
 application later, now that legacy is confirmed merely deprecated-with-
 warning, not actually removed, in this IDF version.
 
+## GPS UART confirmed working end-to-end (2026-09-17 night) -- bring-up complete
+
+Wired ArdunioUsbBridgeToCan's simulated GPS output (Arduino pin 3,
+SoftwareSerial, 9600 baud, 5V logic) through an existing voltage divider
+down to GPIO7 (RX); GPIO6 (TX) wired but unused. A `gps_receive_task`
+(plain `uart_read_bytes`, no NMEA parsing yet) confirmed clean, valid
+`$GPRMC` sentences with correct checksums arriving intact.
+
+**This closes out first-pass bring-up on all four fronts**: LED (GPIO48),
+native Wi-Fi+BLE (working with the real, unmodified phone app), native CAN
+(TWAI, receiving real simulator frames), and now GPS UART -- all four
+confirmed on real hardware in one evening. Nothing about the *real*
+application (HTTP API port, OBD/UDS logic, etc.) has been ported yet --
+see the migration plan above -- but every piece of hardware this new
+board needs to replace the P4+C6+MCP2515 design has now been individually
+proven to work.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
