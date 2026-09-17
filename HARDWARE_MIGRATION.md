@@ -284,6 +284,22 @@ daylight/fresh eyes, not more guessing late at night). **Next step**:
 continuity-check every CAN wire individually with a multimeter (TXD, RXD,
 CANH, CANL, GND, 3.3V to the SN65HVD230) rather than just looking at it.
 
+**Unifying theory (raised by the user, worth taking seriously): this and
+the DHCP failure below may be the *same* root cause, not two unrelated
+bugs.** Both a clean CAN differential signal and a successful DHCP
+exchange (the ESP32 *transmitting* DHCP offers back to the phone, not
+just receiving -- more TX-load-bearing than the BLE advertising/802.11
+association steps that still work fine) depend on stable power the same
+way the earlier Wi-Fi-calibration brownout did. Given how much physical
+handling this breadboard setup took tonight (dozens of BOOT+RST presses,
+full USB unplug/replugs, port-swapping, resistor changes), a connector or
+breadboard rail could plausibly have degraded generally, not just on the
+CAN wires specifically. **Next time, check this before treating CAN and
+DHCP as separate mysteries**: measure the board's actual 3.3V rail with a
+multimeter under load, and try swapping to fresh, known-good USB cables
+entirely rather than continuing to reuse tonight's (possibly worn)
+connections.
+
 **Native USB-Serial/JTAG port (the one used all night) needs manual
 BOOT+RST before every flash/monitor, confirmed structural, not
 timing** -- `esptool`'s own `--before=default-reset` and `idf.py
