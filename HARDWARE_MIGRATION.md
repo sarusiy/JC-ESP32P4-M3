@@ -211,6 +211,39 @@ marginal regulator, not by fixing it. If single-supply operation turns
 out not to be reliable long-term, the real fix would be a bulk/bypass
 capacitor added physically near the module, not a cable swap.
 
+## Native CAN (TWAI) confirmed working end-to-end (2026-09-17 night)
+
+Wired the SN65HVD230 transceiver to GPIO4 (TX) / GPIO5 (RX) and connected
+CANH/CANL to the ArdunioUsbBridgeToCan simulator (common GND included) --
+**no termination resistor on this board's end yet**. Added a
+`can_receive_task` (legacy `driver/twai.h` API -- see below for why not
+the new one) that just logs every received frame.
+
+**Confirmed on real hardware, first try**: receiving clean, steady frames
+on `0x120`/`0x180`/`0x220` -- exactly the simulator's known engine/
+vehicle/body broadcast IDs (see project memory). This is the core promise
+of the whole hardware migration validated end-to-end: CAN frames flowing
+through this chip's native TWAI peripheral and a plain transceiver, zero
+SPI, zero external CAN controller chip. Working even without the far-end
+terminator, though that's still worth closing before relying on this
+under heavier bus load or longer wiring -- an untenmpted bus can look
+fine at low traffic and degrade under load from reflections.
+
+**Real ESP-IDF v6.1-beta1 API-split hit while building this**: this beta
+has split the TWAI driver into two separate, mutually-exclusive
+components -- the new `esp_driver_twai` (handle-based `esp_twai.h`/
+`esp_twai_onchip.h` API) and a legacy-compatibility one (component name
+just `driver`, header still at the old `driver/twai.h` path with the
+familiar `twai_driver_install`/`twai_start`/`twai_receive` calls this
+bring-up code uses). The legacy header additionally emits a `#warning`
+nudging toward the new API, which this project's default `-Werror`
+promotes to a hard build failure -- worked around with a targeted
+`target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=cpp)` in
+`src/CMakeLists.txt` rather than switching APIs mid-bring-up. Worth
+reconsidering migrating to the new `esp_twai.h` API for the real
+application later, now that legacy is confirmed merely deprecated-with-
+warning, not actually removed, in this IDF version.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are

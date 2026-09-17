@@ -36,6 +36,7 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "led_strip.h"
+#include "driver/twai.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -45,6 +46,16 @@
 static const char *TAG = "bringup";
 
 #define LED_GPIO_CANDIDATE 48
+/* First real test of the native TWAI (CAN) controller -- the whole point
+ * of this hardware migration (see HARDWARE_MIGRATION.md's "Why change
+ * hardware"): no SPI, no external MCP2515 controller chip, just these two
+ * GPIOs straight into an SN65HVD230 transceiver's TXD/RXD pins. 500 kbps
+ * to match ArdunioUsbBridgeToCan's simulator (see project memory). Chosen
+ * as safe general-purpose pins per the vendor pinout diagram: not
+ * strapping (0/3/45/46), not USB (19/20), not PSRAM (35/36/37), not the
+ * confirmed LED pin (48). */
+#define CAN_TX_GPIO 4
+#define CAN_RX_GPIO 5
 #define WIFI_AP_SSID "CarTheftGuard-P4"
 #define WIFI_AP_PASSWORD "&Car1310"
 #define WIFI_AP_IP "192.168.4.1"
@@ -199,6 +210,64 @@ static void start_ble(void)
     ESP_LOGI(TAG, "NimBLE host started (native controller).");
 }
 
+/* Just logs every frame it receives -- proves the physical CAN wiring
+ * (S3 -> SN65HVD230 -> CANH/CANL -> simulator) works before any real
+ * protocol logic gets built on top. No termination resistor on this end
+ * yet (see HARDWARE_MIGRATION.md) -- if frames show up reliably anyway,
+ * that's still worth knowing, but don't conclude the bus is healthy
+ * long-term from that alone; a missing terminator causing reflections
+ * can look fine at low traffic/short wire runs and get worse under load. */
+static void can_receive_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        twai_message_t message;
+        esp_err_t err = twai_receive(&message, pdMS_TO_TICKS(1000));
+        if (err == ESP_OK) {
+            char data_hex[3 * 8 + 1] = {0};
+            for (int i = 0; i < message.data_length_code && i < 8; i++) {
+                snprintf(data_hex + i * 3, 4, "%02X ", message.data[i]);
+            }
+            ESP_LOGI(TAG, "CAN RX id=0x%lx%s dlc=%d data=%s",
+                     (unsigned long)message.identifier,
+                     message.extd ? " (ext)" : "", message.data_length_code, data_hex);
+        } else if (err == ESP_ERR_TIMEOUT) {
+            ESP_LOGI(TAG, "CAN RX: no frames in the last second");
+        } else {
+            ESP_LOGW(TAG, "twai_receive error: %s", esp_err_to_name(err));
+        }
+
+        twai_status_info_t status;
+        if (twai_get_status_info(&status) == ESP_OK && status.state == TWAI_STATE_BUS_OFF) {
+            ESP_LOGE(TAG, "CAN controller is BUS-OFF (too many errors) -- recovering...");
+            twai_initiate_recovery();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            twai_start();
+        }
+    }
+}
+
+static void start_can(void)
+{
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+            CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "twai_driver_install failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = twai_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "twai_start failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "CAN ready: TX=GPIO%d RX=GPIO%d 500kbps", CAN_TX_GPIO, CAN_RX_GPIO);
+    xTaskCreate(can_receive_task, "can_rx", 4096, NULL, 5, NULL);
+}
+
 void app_main(void)
 {
     esp_chip_info_t chip_info;
@@ -238,6 +307,7 @@ void app_main(void)
 
     start_wifi_ap();
     start_ble();
+    start_can();
 
     ESP_LOGI(TAG, "Blinking LED at the app-controlled rate (default %lu ms half-period) -- "
              "connect with the CarTheftGuard app and adjust it from the Control tab.",
