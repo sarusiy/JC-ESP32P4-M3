@@ -161,6 +161,56 @@ the first two questions empirically instead of guessing from photos:
     upstream component fixes it or this project switches to a hand-rolled
     WS2812/RMT driver instead of the managed component).
 
+## Native Wi-Fi + BLE confirmed working end-to-end (2026-09-17 evening)
+
+Extended the bring-up firmware to start a native SoftAP (no ESP-Hosted, no
+C6 co-processor -- this chip's own Wi-Fi radio) and native NimBLE
+advertising, **deliberately reusing JC-ESP32P4-M3's exact identity**
+(BLE name `JC-P4-C6`, AP SSID `CarTheftGuard-P4`/password `&Car1310`) plus
+its exact `POST /api/frequency` ("freq <ms>") contract, purely so the
+*already-installed, unmodified* CarTheftGuard phone app could connect to
+this new board with zero app changes, as a fast way to prove native
+Wi-Fi+BLE actually works before porting anything else. **Confirmed working
+end-to-end**: the app auto-detected the board via BLE, auto-joined its
+Wi-Fi, and the Control tab's blink-rate control changed the physical LED's
+blink rate in real time. This is a deliberate temporary identity, not a
+real one -- expect to change it once this stops being a stand-in for the
+P4 board.
+
+**Hit and resolved the exact same brownout failure mode as the P4 board**,
+but immediately, on the very first Wi-Fi radio use (PHY calibration),
+before any CAN work was even involved: `phy_init: falling back to full
+calibration` (no saved RF cal data yet) immediately followed by
+`E BOD: Brownout detector was triggered` / `rst:0x3 RTC_SW_SYS_RST`,
+looping forever since a calibration that never completes never gets saved,
+so every reboot repeats the same expensive full recalibration. **Fixed by
+powering the board from two USB sources simultaneously**: the existing
+data connection to the PC (native USB port) left as-is, plus a second,
+separate cable from a wall charger into the board's *other* USB-C port
+(the CH343P/UART one) purely for extra current -- both ports share the
+same on-board 5V/GND net, so this is just two power sources in parallel,
+not a data conflict. One successful calibration was all it took; this
+should now boot fine on a single supply too, since RF cal data is
+persisted -- not yet re-tested on single-supply power to confirm.
+
+**Why this is worth taking seriously, not just brushing off as "bad
+cable"**: the user asked directly why this wouldn't have hit the P4 board
+under the same cable/PC too, which is a fair challenge to "just use a
+different cable." The real structural difference: the P4 board's Wi-Fi
+runs on a *separate* ESP32-C6 co-processor chip with its own on-board
+power circuit, splitting the P4 board's own core-CPU current draw and the
+C6's Wi-Fi-radio current draw across two independent regulators/decoupling
+networks. This S3 board has everything -- CPU and Wi-Fi radio both -- on
+one chip, fed by a single shared onboard regulator (a basic AMS1117
+linear regulator, visible on the board photos, not known for especially
+fast transient response). So the likely real bottleneck is this board's
+*own* onboard power regulation/decoupling being marginal for a Wi-Fi
+radio current spike, not the USB cable or PC port per se -- the wall-
+charger fix works by adding parallel current capacity upstream of that
+marginal regulator, not by fixing it. If single-supply operation turns
+out not to be reliable long-term, the real fix would be a bulk/bypass
+capacitor added physically near the module, not a cable swap.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
