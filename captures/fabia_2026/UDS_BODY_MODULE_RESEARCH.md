@@ -330,6 +330,53 @@ investigation than anything built so far (protocol-level, not address-
 discovery), and a bigger scope than the current DID-sweep/address-sweep
 tools support.
 
+## Update 2026-09-16 — found the likely routing mechanism: VWTP 2.0
+
+Followed up on the "practical next step" above and found a concrete,
+documented candidate: **VWTP 2.0** (VW Transport Protocol), VW's own
+proprietary transport layer, described as "the underlying transport used
+in all CAN VWs" by
+[baconwaifu/PyVCDS](https://github.com/baconwaifu/PyVCDS) (a from-scratch
+VCDS re-implementation via black-box reverse engineering). Its
+`vwtp.py` gives concrete, byte-level connection-setup details:
+
+- **Request always goes to CAN ID `0x200`** (fixed, not per-module).
+- **Request payload (7 bytes)**: `[dest_addr, 0xC0, 0x00, 0x10, rx_id_lo, rx_id_hi, 0x01]`
+  -- `dest_addr` is a **single-byte logical/component address** (the same
+  numbers VCDS displays, e.g. `0x46`=Central Convenience, `0x42`=Door
+  Electronics Driver -- a completely different addressing dimension from
+  the raw CAN IDs in the candidate table above), `rx_id` is a CAN ID *we*
+  choose to receive on, `0x01` marks the KWP2000 application protocol.
+- **Response comes back on `0x200 + dest_addr`**: a positive ack
+  (`byte[1] == 0xD0`) carries a **negotiated TX CAN ID** in bytes 4-5
+  (little-endian) -- the actual diagnostic-data CAN ID pair for that
+  session is allocated dynamically per-connection, not fixed like the
+  `ConnorHowell/vag-uds-ids` table assumes.
+
+This reframes the whole address-hunting approach: if this platform (or
+this specific module) still needs VWTP 2.0 rather than direct UDS-over-
+CAN, no amount of guessing raw CAN IDs would ever find it, since the
+"module addresses" in the public list may be VCDS-internal logical
+numbers, not independently-dialable bus addresses at all. It's also
+consistent with the Gateway (`0x710`) answering plain UDS directly while
+literally nothing else in the full `0x700`-`0x7FF` sweep did -- a modern
+gateway plausibly speaks current UDS-over-CAN on its own interface while
+still routing to older body modules via this legacy scheme internally.
+
+**Built same day**: a VWTP 2.0 connection-setup discovery tool
+(`POST`/`GET /api/vwtp/scan`, Record tab's "VWTP 2.0 connection probe"),
+sweeping the full `0x00`-`0xFF` logical-address space with a chosen RX
+id, recording any address that gets a real response (positive or
+negative) plus its negotiated TX id if positive. Not yet tested against
+the real car.
+
+Sources: [baconwaifu/PyVCDS](https://github.com/baconwaifu/PyVCDS),
+[vwtp.py](https://github.com/baconwaifu/PyVCDS/blob/master/vwtp.py),
+[vwtp.txt](https://github.com/baconwaifu/PyVCDS/blob/master/vwtp.txt),
+[aep/vag_reverse_engineering LOG.md](https://github.com/aep/vag_reverse_engineering/blob/master/LOG.md)
+(independently mentions the same "session protocol that requests a pair
+of canbus ids from the gateway" concept, different car/generation).
+
 ## Open risk / things that could go sideways
 
 - These addresses might simply not respond on this specific 2026 Fabia

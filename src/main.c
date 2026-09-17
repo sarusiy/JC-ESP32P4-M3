@@ -25,6 +25,7 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #if defined(CONFIG_BT_ENABLED) && defined(CONFIG_BT_NIMBLE_ENABLED)
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
@@ -545,6 +546,89 @@ typedef struct {
 static uds_addr_scan_t s_uds_addr_scan;
 static portMUX_TYPE s_uds_addr_scan_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_uds_addr_scan_requested;
+
+/* Deep scan: combines the address-discovery sweep above with an automatic
+ * identification-DID sweep (ISO 14229-1 Annex F block, 0xF180-0xF1A0 --
+ * "who are you": part number, serial number, system name, VIN, hw/sw
+ * versions) against every address that responds, instead of requiring a
+ * human to notice a hit and manually re-run a separate DID sweep against
+ * it. Meant to run unattended (e.g. overnight) across the whole
+ * 0x700-0x7FF range and produce a full module map in one pass -- added
+ * 2026-09-17 after a manual address-scan-then-DID-sweep cycle on a single
+ * found candidate (0x78F) turned out to be a dead end, prompting "why not
+ * automate the whole space instead of one address at a time".
+ *
+ * Survives brownout resets (a real, repeatedly observed failure mode on
+ * this board under sustained CAN-TX load -- see UDS_BODY_MODULE_RESEARCH.md
+ * and project memory) by persisting progress to NVS as it goes and
+ * resuming automatically on boot instead of losing an overnight run to a
+ * single crash partway through: deep_scan_nvs_save_progress() after every
+ * address, deep_scan_nvs_save_hits() immediately whenever a new module is
+ * identified (not just at the very end), and deep_scan_resume_from_nvs()
+ * called once at boot (see app_main) to pick the scan back up from
+ * wherever it left off, with no need for the phone app to re-trigger it. */
+#define DEEP_SCAN_ID_START 0xF180
+#define DEEP_SCAN_ID_END 0xF1A0
+#define DEEP_SCAN_MAX_HITS 8
+#define DEEP_SCAN_MAX_DIDS_PER_HIT 16
+#define DEEP_SCAN_NVS_NAMESPACE "deepscan"
+
+typedef struct {
+    uint32_t addr;
+    uds_session_state_t session_state;
+    uint8_t did_result_count;
+    uds_scan_result_t did_results[DEEP_SCAN_MAX_DIDS_PER_HIT];
+} deep_scan_hit_t;
+
+typedef struct {
+    uint32_t req_start;
+    uint32_t req_end;
+    uint32_t response_offset;
+    bool extended;
+    uds_scan_state_t state;
+    uint32_t current_req; /* progress indicator while running, and the NVS-persisted resume point */
+    uint8_t hit_count;
+    deep_scan_hit_t hits[DEEP_SCAN_MAX_HITS];
+} deep_scan_t;
+
+static deep_scan_t s_deep_scan;
+static portMUX_TYPE s_deep_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_deep_scan_requested;
+
+/* VWTP 2.0 (VW Transport Protocol) connection-setup probe -- a completely
+ * different addressing scheme from the UDS address-discovery sweep above.
+ * Candidates here are single-byte logical/component addresses (the same
+ * numbers VCDS shows, e.g. 0x46=Central Convenience, 0x42=Door Electronics
+ * Driver), not raw CAN IDs. Sourced 2026-09-16 from PyVCDS's vwtp.py (see
+ * UDS_BODY_MODULE_RESEARCH.md): the connection request always goes to CAN
+ * ID 0x200; the response comes back on 0x200 + the logical address byte,
+ * carrying a negotiated TX CAN ID if accepted. This exists because the
+ * full 256-address direct UDS sweep found only the Gateway reachable --
+ * body modules on this platform may only be reachable via this older,
+ * session-based scheme instead of direct point-to-point CAN addressing. */
+#define VWTP_CONNECT_REQUEST_ID 0x200
+#define VWTP_SCAN_MAX_RESULTS 32
+#define VWTP_SCAN_MAX_RANGE 256
+
+typedef struct {
+    uint8_t addr;
+    bool positive;
+    uint16_t tx_id;
+} vwtp_scan_result_t;
+
+typedef struct {
+    uint8_t addr_start;
+    uint8_t addr_end;
+    uint16_t rx_id;
+    uds_scan_state_t state;
+    uint8_t current_addr;
+    uint8_t result_count;
+    vwtp_scan_result_t results[VWTP_SCAN_MAX_RESULTS];
+} vwtp_scan_t;
+
+static vwtp_scan_t s_vwtp_scan;
+static portMUX_TYPE s_vwtp_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_vwtp_scan_requested;
 
 /* Which OBD-II addressing scheme has actually gotten a response so far.
  * UNKNOWN means "haven't heard back on either scheme yet" -- obd_send_request
@@ -1337,6 +1421,25 @@ static bool uds_send_and_receive(uint32_t request_id, uint32_t response_id, bool
     return isotp_reassemble(response.id, &response, out_payload, out_len, deadline_us);
 }
 
+/* Same exact-ID-match send/wait as uds_send_and_receive, but returns the
+ * raw response frame with no ISO-TP reassembly -- VWTP 2.0's connection-
+ * setup frames (see vwtp_connect below) are NOT ISO-TP formatted, so
+ * isotp_reassemble() would misinterpret their first byte (an echoed
+ * address, not an ISO-TP PCI/length byte) as frame-type metadata and
+ * corrupt the read. */
+static bool raw_send_and_receive(uint32_t request_id, uint32_t response_id, bool extended,
+                                  const uint8_t *request, uint8_t request_len,
+                                  obd_frame_t *out_response)
+{
+    s_uds_expected_response_id = response_id;
+    s_uds_request_pending = true;
+    mcp2515_send(request_id, extended, request_len, request);
+
+    bool got = xQueueReceive(s_uds_response_queue, out_response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+    s_uds_request_pending = false;
+    return got;
+}
+
 /* Sends UDS ReadDataByIdentifier (service 0x22) for one DID to a specific
  * module and waits for its response. */
 static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extended,
@@ -1516,6 +1619,426 @@ static void obd_query_uds_addr_scan_if_requested(void)
     ESP_LOGI(TAG, "UDS address scan complete: %u address(es) responded", (unsigned)s_uds_addr_scan.result_count);
 }
 
+/* Deep scan NVS persistence -- see deep_scan_t's doc comment for why this
+ * exists (surviving brownout resets during an unattended overnight run).
+ * Every function here opens/closes its own handle rather than holding one
+ * open for the scan's whole lifetime, since these are called relatively
+ * rarely (once per address, once per hit) and it keeps the failure mode of
+ * a single call simple to reason about. Failures are logged and otherwise
+ * ignored -- losing the ability to resume after a reset is a degradation
+ * (falls back to "scan doesn't survive a crash", same as before this
+ * feature existed), not a reason to abort an in-progress scan. */
+static void deep_scan_nvs_save_progress(uint32_t current_req)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u32(handle, "cur_req", current_req);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_nvs_save_hits(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    uint8_t hit_count = s_deep_scan.hit_count;
+    deep_scan_hit_t hits_copy[DEEP_SCAN_MAX_HITS];
+    memcpy(hits_copy, s_deep_scan.hits, sizeof(hits_copy));
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    nvs_set_u8(handle, "hit_count", hit_count);
+    nvs_set_blob(handle, "hits", hits_copy, sizeof(hits_copy));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+/* Marks a deep scan as started/still-in-progress (so a boot-time check
+ * knows to resume it) or clears that mark once it finishes or is aborted
+ * (Passive mode, out-of-range request) -- the actual scan parameters
+ * (req_start/req_end/response_offset/extended) are written once at start
+ * time via a separate call from deep_scan_start_http_handler, not here. */
+static void deep_scan_nvs_set_active(bool active)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(handle, "active", active ? 1 : 0);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_nvs_save_params(uint32_t req_start, uint32_t req_end, uint32_t response_offset, bool extended)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u32(handle, "req_start", req_start);
+    nvs_set_u32(handle, "req_end", req_end);
+    nvs_set_u32(handle, "resp_off", response_offset);
+    nvs_set_u8(handle, "extended", extended ? 1 : 0);
+    nvs_set_u32(handle, "cur_req", req_start);
+    nvs_set_u8(handle, "hit_count", 0);
+    deep_scan_hit_t empty_hits[DEEP_SCAN_MAX_HITS] = {0};
+    nvs_set_blob(handle, "hits", empty_hits, sizeof(empty_hits));
+    nvs_set_u8(handle, "active", 1);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+/* Called once at boot (see app_main) -- if a deep scan was still marked
+ * active in NVS (i.e. the board reset, most likely a brownout, before the
+ * scan reached the end of its range or was explicitly stopped), restores
+ * its parameters and progress and re-requests it, so it picks back up from
+ * roughly where it left off instead of the whole overnight run being lost
+ * to one crash. Safe to call even if no deep scan was ever started --
+ * nvs_get_u8 on a namespace/key that's never been written just returns
+ * ESP_ERR_NVS_NOT_FOUND and this quietly does nothing. */
+static void deep_scan_resume_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    uint8_t active = 0;
+    if (nvs_get_u8(handle, "active", &active) != ESP_OK || !active) {
+        nvs_close(handle);
+        return;
+    }
+    uint32_t req_start = 0, req_end = 0, response_offset = 0, current_req = 0;
+    uint8_t extended = 0, hit_count = 0;
+    nvs_get_u32(handle, "req_start", &req_start);
+    nvs_get_u32(handle, "req_end", &req_end);
+    nvs_get_u32(handle, "resp_off", &response_offset);
+    nvs_get_u8(handle, "extended", &extended);
+    nvs_get_u32(handle, "cur_req", &current_req);
+    nvs_get_u8(handle, "hit_count", &hit_count);
+    deep_scan_hit_t hits[DEEP_SCAN_MAX_HITS] = {0};
+    size_t hits_size = sizeof(hits);
+    nvs_get_blob(handle, "hits", hits, &hits_size);
+    nvs_close(handle);
+
+    if (req_end < req_start || current_req > req_end) {
+        /* Malformed/stale state -- don't resume into a bad range. */
+        return;
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.req_start = req_start;
+    s_deep_scan.req_end = req_end;
+    s_deep_scan.response_offset = response_offset;
+    s_deep_scan.extended = extended != 0;
+    s_deep_scan.current_req = current_req;
+    s_deep_scan.hit_count = hit_count > DEEP_SCAN_MAX_HITS ? DEEP_SCAN_MAX_HITS : hit_count;
+    memcpy(s_deep_scan.hits, hits, sizeof(hits));
+    s_deep_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan_requested = true;
+    ESP_LOGI(TAG, "Deep scan: resuming after reset at 0x%lx (range 0x%lx-0x%lx, %u hit(s) so far)",
+             (unsigned long)current_req, (unsigned long)req_start, (unsigned long)req_end, (unsigned)hit_count);
+}
+
+/* Services a deep-scan request set up by deep_scan_start_http_handler (or
+ * resumed at boot by deep_scan_resume_from_nvs after a reset): sweeps
+ * addresses exactly like obd_query_uds_addr_scan_if_requested above, but
+ * for every address that gets a real response (not a timeout), immediately
+ * runs the identification-DID sweep (0xF180-0xF1A0) against it before
+ * moving to the next candidate -- see deep_scan_t's doc comment for why
+ * this exists instead of requiring a manual re-scan per hit. */
+static void obd_query_deep_scan_if_requested(void)
+{
+    if (!s_deep_scan_requested) {
+        return;
+    }
+    s_deep_scan_requested = false;
+
+    uint32_t req_start, req_end, response_offset, resume_req;
+    bool extended;
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    req_start = s_deep_scan.req_start;
+    req_end = s_deep_scan.req_end;
+    response_offset = s_deep_scan.response_offset;
+    extended = s_deep_scan.extended;
+    resume_req = s_deep_scan.current_req;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "Deep scan requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_deep_scan_lock);
+        s_deep_scan.state = UDS_SCAN_ERROR;
+        portEXIT_CRITICAL(&s_deep_scan_lock);
+        deep_scan_nvs_set_active(false);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deep scan starting at 0x%lx (range 0x%lx-0x%lx)",
+             (unsigned long)resume_req, (unsigned long)req_start, (unsigned long)req_end);
+
+    for (uint32_t req_id = resume_req; req_id <= req_end; req_id++) {
+        portENTER_CRITICAL(&s_deep_scan_lock);
+        s_deep_scan.current_req = req_id;
+        portEXIT_CRITICAL(&s_deep_scan_lock);
+        deep_scan_nvs_save_progress(req_id);
+
+        uint32_t resp_id = req_id + response_offset;
+        uds_session_state_t session_state = uds_start_session(req_id, resp_id, extended);
+
+        if (session_state != UDS_SESSION_TIMEOUT) {
+            ESP_LOGI(TAG, "Deep scan: 0x%lx -> %s, identifying...", (unsigned long)req_id,
+                     session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+
+            deep_scan_hit_t hit;
+            memset(&hit, 0, sizeof(hit));
+            hit.addr = req_id;
+            hit.session_state = session_state;
+            for (uint32_t did = DEEP_SCAN_ID_START; did <= DEEP_SCAN_ID_END; did++) {
+                uint8_t payload[ISOTP_MAX_PAYLOAD];
+                uint8_t payload_len = 0;
+                bool ok = uds_read_did(req_id, resp_id, extended, (uint16_t)did, payload, &payload_len);
+                if (ok && payload_len >= 3 && payload[0] == 0x62 &&
+                    (uint16_t)(((uint16_t)payload[1] << 8) | payload[2]) == (uint16_t)did &&
+                    hit.did_result_count < DEEP_SCAN_MAX_DIDS_PER_HIT) {
+                    uds_scan_result_t *result = &hit.did_results[hit.did_result_count++];
+                    result->did = (uint16_t)did;
+                    result->dlc = payload_len > 8 ? 8 : payload_len;
+                    memcpy(result->data, payload, result->dlc);
+                }
+                vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+            }
+
+            portENTER_CRITICAL(&s_deep_scan_lock);
+            if (s_deep_scan.hit_count < DEEP_SCAN_MAX_HITS) {
+                s_deep_scan.hits[s_deep_scan.hit_count++] = hit;
+            }
+            portEXIT_CRITICAL(&s_deep_scan_lock);
+            deep_scan_nvs_save_hits();
+            ESP_LOGI(TAG, "Deep scan: 0x%lx identified, %u DID(s) responded",
+                     (unsigned long)req_id, (unsigned)hit.did_result_count);
+        } else {
+            ESP_LOGD(TAG, "Deep scan: 0x%lx -> timeout", (unsigned long)req_id);
+            vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+        }
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.state = UDS_SCAN_DONE;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    deep_scan_nvs_set_active(false);
+    ESP_LOGI(TAG, "Deep scan complete: %u module(s) identified", (unsigned)s_deep_scan.hit_count);
+}
+
+/* One VWTP 2.0 connection-setup attempt -- see the vwtp_scan_t doc comment
+ * above. Always sent to CAN ID 0x200; response comes back on
+ * 0x200 + dest_addr. A positive response (byte[1] == 0xD0) carries the
+ * negotiated TX CAN ID in bytes[4:5] (little-endian). This discovery tool
+ * only records that the address is live and what TX ID it offered -- it
+ * doesn't open a full session or exchange any actual diagnostic data. */
+static bool vwtp_connect(uint8_t dest_addr, uint16_t requested_rx_id, bool *out_positive, uint16_t *out_tx_id)
+{
+    uint8_t request[7] = {
+        dest_addr, 0xC0, 0x00, 0x10,
+        (uint8_t)(requested_rx_id & 0xFF), (uint8_t)(requested_rx_id >> 8),
+        0x01,
+    };
+    obd_frame_t response;
+    bool got = raw_send_and_receive(VWTP_CONNECT_REQUEST_ID, VWTP_CONNECT_REQUEST_ID + dest_addr,
+                                     false, request, sizeof(request), &response);
+    if (!got) {
+        return false;
+    }
+    *out_positive = (response.dlc >= 2 && response.data[1] == 0xD0);
+    *out_tx_id = (*out_positive && response.dlc >= 6)
+            ? (uint16_t)((uint16_t)response.data[4] | ((uint16_t)response.data[5] << 8))
+            : 0;
+    return true;
+}
+
+/* VWTP scan NVS persistence -- same reasoning and pattern as the deep-scan
+ * helpers above (survives brownout resets during an unattended run by
+ * persisting progress/results as it goes and resuming automatically at
+ * boot). Added 2026-09-17 evening after a real-car deep scan confirmed only
+ * the Gateway is reachable via direct addressing, making a clean
+ * (non-crashing) full VWTP sweep the next thing worth a resilient,
+ * unattended run for. */
+#define VWTP_SCAN_NVS_NAMESPACE "vwtpscan"
+
+static void vwtp_scan_nvs_save_progress(uint8_t current_addr)
+{
+    nvs_handle_t handle;
+    if (nvs_open(VWTP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(handle, "cur_addr", current_addr);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void vwtp_scan_nvs_save_results(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(VWTP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    uint8_t result_count = s_vwtp_scan.result_count;
+    vwtp_scan_result_t results_copy[VWTP_SCAN_MAX_RESULTS];
+    memcpy(results_copy, s_vwtp_scan.results, sizeof(results_copy));
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+    nvs_set_u8(handle, "result_cnt", result_count);
+    nvs_set_blob(handle, "results", results_copy, sizeof(results_copy));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void vwtp_scan_nvs_set_active(bool active)
+{
+    nvs_handle_t handle;
+    if (nvs_open(VWTP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(handle, "active", active ? 1 : 0);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void vwtp_scan_nvs_save_params(uint8_t addr_start, uint8_t addr_end, uint16_t rx_id)
+{
+    nvs_handle_t handle;
+    if (nvs_open(VWTP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(handle, "addr_start", addr_start);
+    nvs_set_u8(handle, "addr_end", addr_end);
+    nvs_set_u16(handle, "rx_id", rx_id);
+    nvs_set_u8(handle, "cur_addr", addr_start);
+    nvs_set_u8(handle, "result_cnt", 0);
+    vwtp_scan_result_t empty_results[VWTP_SCAN_MAX_RESULTS] = {0};
+    nvs_set_blob(handle, "results", empty_results, sizeof(empty_results));
+    nvs_set_u8(handle, "active", 1);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+/* Called once at boot (see app_main), same as deep_scan_resume_from_nvs --
+ * resumes an interrupted VWTP scan from roughly where it left off instead
+ * of losing an unattended run to a single brownout reset. */
+static void vwtp_scan_resume_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(VWTP_SCAN_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    uint8_t active = 0;
+    if (nvs_get_u8(handle, "active", &active) != ESP_OK || !active) {
+        nvs_close(handle);
+        return;
+    }
+    uint8_t addr_start = 0, addr_end = 0, current_addr = 0, result_count = 0;
+    uint16_t rx_id = 0;
+    nvs_get_u8(handle, "addr_start", &addr_start);
+    nvs_get_u8(handle, "addr_end", &addr_end);
+    nvs_get_u16(handle, "rx_id", &rx_id);
+    nvs_get_u8(handle, "cur_addr", &current_addr);
+    nvs_get_u8(handle, "result_cnt", &result_count);
+    vwtp_scan_result_t results[VWTP_SCAN_MAX_RESULTS] = {0};
+    size_t results_size = sizeof(results);
+    nvs_get_blob(handle, "results", results, &results_size);
+    nvs_close(handle);
+
+    if (addr_end < addr_start || current_addr > addr_end) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    s_vwtp_scan.addr_start = addr_start;
+    s_vwtp_scan.addr_end = addr_end;
+    s_vwtp_scan.rx_id = rx_id;
+    s_vwtp_scan.current_addr = current_addr;
+    s_vwtp_scan.result_count = result_count > VWTP_SCAN_MAX_RESULTS ? VWTP_SCAN_MAX_RESULTS : result_count;
+    memcpy(s_vwtp_scan.results, results, sizeof(results));
+    s_vwtp_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+    s_vwtp_scan_requested = true;
+    ESP_LOGI(TAG, "VWTP scan: resuming after reset at 0x%02x (range 0x%02x-0x%02x, %u hit(s) so far)",
+             current_addr, addr_start, addr_end, (unsigned)result_count);
+}
+
+/* Services a VWTP 2.0 address-discovery sweep set up by
+ * vwtp_scan_start_http_handler (or resumed at boot by
+ * vwtp_scan_resume_from_nvs after a reset): attempts a connection-setup to
+ * every logical address in the requested range, recording any that got a
+ * real response (positive or negative -- either means a live module is
+ * listening there, unlike a timeout). Same in-flight-request-slot sharing
+ * and pacing as the UDS address sweep above. */
+static void obd_query_vwtp_scan_if_requested(void)
+{
+    if (!s_vwtp_scan_requested) {
+        return;
+    }
+    s_vwtp_scan_requested = false;
+
+    uint8_t addr_start, addr_end, resume_addr;
+    uint16_t rx_id;
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    addr_start = s_vwtp_scan.addr_start;
+    addr_end = s_vwtp_scan.addr_end;
+    rx_id = s_vwtp_scan.rx_id;
+    resume_addr = s_vwtp_scan.current_addr;
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "VWTP scan requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_vwtp_scan_lock);
+        s_vwtp_scan.state = UDS_SCAN_ERROR;
+        portEXIT_CRITICAL(&s_vwtp_scan_lock);
+        vwtp_scan_nvs_set_active(false);
+        return;
+    }
+
+    ESP_LOGI(TAG, "VWTP scan starting at 0x%02x (range 0x%02x-0x%02x) rx_id=0x%03x",
+             resume_addr, addr_start, addr_end, (unsigned)rx_id);
+
+    for (uint32_t addr = resume_addr; addr <= addr_end; addr++) {
+        portENTER_CRITICAL(&s_vwtp_scan_lock);
+        s_vwtp_scan.current_addr = (uint8_t)addr;
+        portEXIT_CRITICAL(&s_vwtp_scan_lock);
+        vwtp_scan_nvs_save_progress((uint8_t)addr);
+
+        bool positive = false;
+        uint16_t tx_id = 0;
+        bool got = vwtp_connect((uint8_t)addr, rx_id, &positive, &tx_id);
+
+        if (got) {
+            portENTER_CRITICAL(&s_vwtp_scan_lock);
+            if (s_vwtp_scan.result_count < VWTP_SCAN_MAX_RESULTS) {
+                vwtp_scan_result_t *result = &s_vwtp_scan.results[s_vwtp_scan.result_count++];
+                result->addr = (uint8_t)addr;
+                result->positive = positive;
+                result->tx_id = tx_id;
+            }
+            portEXIT_CRITICAL(&s_vwtp_scan_lock);
+            vwtp_scan_nvs_save_results();
+            ESP_LOGI(TAG, "VWTP scan: 0x%02x -> %s (tx_id=0x%03x)", (unsigned)addr,
+                     positive ? "positive" : "negative", (unsigned)tx_id);
+        } else {
+            ESP_LOGD(TAG, "VWTP scan: 0x%02x -> timeout", (unsigned)addr);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+    }
+
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    s_vwtp_scan.state = UDS_SCAN_DONE;
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+    vwtp_scan_nvs_set_active(false);
+    ESP_LOGI(TAG, "VWTP scan complete: %u address(es) responded", (unsigned)s_vwtp_scan.result_count);
+}
+
 /* Acts as a minimal scan tool: requests each supported PID in turn on the
  * broadcast functional ID, waits for the ECU's 0x7E8 reply, and prints it. */
 static void obd_query_task(void *arg)
@@ -1533,6 +2056,8 @@ static void obd_query_task(void *arg)
         obd_query_vin_if_requested();
         obd_query_uds_scan_if_requested();
         obd_query_uds_addr_scan_if_requested();
+        obd_query_vwtp_scan_if_requested();
+        obd_query_deep_scan_if_requested();
 
         for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
             if (s_can_passive) {
@@ -2393,6 +2918,196 @@ static esp_err_t uds_addr_scan_status_http_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Kicks off a VWTP 2.0 connection-setup sweep -- see vwtp_scan_t's doc
+ * comment. Body (plain text): "addr_start,addr_end,rx_id" -- addr_start/
+ * addr_end/rx_id in hex without a 0x prefix, e.g. "0,FF,300" to probe
+ * every logical address 0x00-0xFF requesting RX id 0x300. */
+static esp_err_t vwtp_scan_start_http_handler(httpd_req_t *request)
+{
+    char body[32] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected addr_start,addr_end,rx_id");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    unsigned long addr_start = 0, addr_end = 0, rx_id = 0;
+    if (sscanf(body, "%lx,%lx,%lx", &addr_start, &addr_end, &rx_id) != 3) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                             "Expected addr_start,addr_end,rx_id (hex,hex,hex)");
+        return ESP_FAIL;
+    }
+    if (addr_end < addr_start || addr_end > 0xFF || (addr_end - addr_start + 1) > VWTP_SCAN_MAX_RANGE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Address range invalid (0x00-0xFF only)");
+        return ESP_FAIL;
+    }
+
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    s_vwtp_scan.addr_start = (uint8_t)addr_start;
+    s_vwtp_scan.addr_end = (uint8_t)addr_end;
+    s_vwtp_scan.rx_id = (uint16_t)rx_id;
+    s_vwtp_scan.current_addr = (uint8_t)addr_start;
+    s_vwtp_scan.result_count = 0;
+    s_vwtp_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+    /* Always starts fresh from addr_start (unlike the boot-time auto-resume
+     * in vwtp_scan_resume_from_nvs, which continues an interrupted one) --
+     * resets the persisted resume point and result list accordingly. */
+    vwtp_scan_nvs_save_params((uint8_t)addr_start, (uint8_t)addr_end, (uint16_t)rx_id);
+    s_vwtp_scan_requested = true;
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"vwtp scan requested\"}");
+    return ESP_OK;
+}
+
+/* Returns current progress/results of the last (or in-progress) VWTP scan. */
+static esp_err_t vwtp_scan_status_http_handler(httpd_req_t *request)
+{
+    vwtp_scan_t snapshot;
+    portENTER_CRITICAL(&s_vwtp_scan_lock);
+    snapshot = s_vwtp_scan;
+    portEXIT_CRITICAL(&s_vwtp_scan_lock);
+
+    const char *state_str;
+    switch (snapshot.state) {
+        case UDS_SCAN_RUNNING: state_str = "running"; break;
+        case UDS_SCAN_DONE: state_str = "done"; break;
+        case UDS_SCAN_ERROR: state_str = "error"; break;
+        default: state_str = "idle"; break;
+    }
+
+    /* Sized for VWTP_SCAN_MAX_RESULTS entries at up to ~48 bytes of JSON each. */
+    static char response[VWTP_SCAN_MAX_RESULTS * 48 + 128];
+    int written = snprintf(response, sizeof(response),
+            "{\"state\":\"%s\",\"current_addr\":\"0x%02x\",\"result_count\":%u,\"results\":[",
+            state_str, snapshot.current_addr, snapshot.result_count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < snapshot.result_count && used < sizeof(response); i++) {
+        written = snprintf(response + used, sizeof(response) - used,
+                "%s{\"addr\":\"0x%02x\",\"session\":\"%s\",\"tx_id\":\"0x%03x\"}",
+                i == 0 ? "" : ",", snapshot.results[i].addr,
+                snapshot.results[i].positive ? "positive" : "negative",
+                (unsigned)snapshot.results[i].tx_id);
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Kicks off a deep scan -- see deep_scan_t's doc comment. Body (plain
+ * text): "req_start,req_end,offset,extended", same format as the plain
+ * address-discovery sweep, e.g. "700,7FF,6A,0" to sweep every address
+ * 0x700-0x7FF with response = request + 0x6A and automatically identify
+ * every hit. Always starts a *fresh* scan from req_start (unlike the
+ * boot-time auto-resume in deep_scan_resume_from_nvs, which continues an
+ * interrupted one) -- deep_scan_nvs_save_params resets the persisted
+ * hit list and resume point accordingly. */
+static esp_err_t deep_scan_start_http_handler(httpd_req_t *request)
+{
+    char body[48] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected req_start,req_end,offset,extended");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    unsigned long req_start = 0, req_end = 0, offset = 0, extended = 0;
+    if (sscanf(body, "%lx,%lx,%lx,%lu", &req_start, &req_end, &offset, &extended) != 4) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                             "Expected req_start,req_end,offset,extended (hex,hex,hex,0|1)");
+        return ESP_FAIL;
+    }
+    if (req_end < req_start || (req_end - req_start + 1) > UDS_ADDR_SCAN_MAX_RANGE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Address range invalid or too large (max 256)");
+        return ESP_FAIL;
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.req_start = (uint32_t)req_start;
+    s_deep_scan.req_end = (uint32_t)req_end;
+    s_deep_scan.response_offset = (uint32_t)offset;
+    s_deep_scan.extended = extended != 0;
+    s_deep_scan.current_req = (uint32_t)req_start;
+    s_deep_scan.hit_count = 0;
+    memset(s_deep_scan.hits, 0, sizeof(s_deep_scan.hits));
+    s_deep_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    deep_scan_nvs_save_params((uint32_t)req_start, (uint32_t)req_end, (uint32_t)offset, extended != 0);
+    s_deep_scan_requested = true;
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"deep scan requested\"}");
+    return ESP_OK;
+}
+
+/* Returns current progress/results of the last (or in-progress) deep scan
+ * -- each hit includes its own nested did_results[], same "did"/"data"
+ * (hex) field names as the plain UDS DID sweep's results[] so app-side
+ * parsing logic can be shared. */
+static esp_err_t deep_scan_status_http_handler(httpd_req_t *request)
+{
+    deep_scan_t snapshot;
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    snapshot = s_deep_scan;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+
+    const char *state_str;
+    switch (snapshot.state) {
+        case UDS_SCAN_RUNNING: state_str = "running"; break;
+        case UDS_SCAN_DONE: state_str = "done"; break;
+        case UDS_SCAN_ERROR: state_str = "error"; break;
+        default: state_str = "idle"; break;
+    }
+
+    /* Sized for DEEP_SCAN_MAX_HITS hits, each with up to
+     * DEEP_SCAN_MAX_DIDS_PER_HIT DID results at up to ~48 bytes of JSON
+     * each, plus per-hit overhead. */
+    static char response[DEEP_SCAN_MAX_HITS * (DEEP_SCAN_MAX_DIDS_PER_HIT * 48 + 96) + 128];
+    int written = snprintf(response, sizeof(response),
+            "{\"state\":\"%s\",\"current_req\":\"0x%03lx\",\"hit_count\":%u,\"hits\":[",
+            state_str, (unsigned long)snapshot.current_req, snapshot.hit_count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < snapshot.hit_count && i < DEEP_SCAN_MAX_HITS && used < sizeof(response); i++) {
+        deep_scan_hit_t *hit = &snapshot.hits[i];
+        written = snprintf(response + used, sizeof(response) - used,
+                "%s{\"addr\":\"0x%03lx\",\"session\":\"%s\",\"did_results\":[",
+                i == 0 ? "" : ",", (unsigned long)hit->addr,
+                hit->session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+
+        for (uint8_t d = 0; d < hit->did_result_count && d < DEEP_SCAN_MAX_DIDS_PER_HIT && used < sizeof(response); d++) {
+            char hex[17] = {0};
+            uint8_t hex_bytes = hit->did_results[d].dlc > 8 ? 8 : hit->did_results[d].dlc;
+            for (uint8_t b = 0; b < hex_bytes; b++) {
+                snprintf(hex + b * 2, 3, "%02X", hit->did_results[d].data[b]);
+            }
+            written = snprintf(response + used, sizeof(response) - used,
+                    "%s{\"did\":\"0x%04x\",\"data\":\"%s\"}",
+                    d == 0 ? "" : ",", hit->did_results[d].did, hex);
+            used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+        }
+        if (used < sizeof(response)) {
+            written = snprintf(response + used, sizeof(response) - used, "]}");
+            used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+        }
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static esp_err_t ota_status_http_handler(httpd_req_t *request)
 {
     const char *state_str;
@@ -2817,14 +3532,16 @@ static void start_frequency_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* Default max_uri_handlers is 8; we now register 20 (frequency, obd,
+    /* Default max_uri_handlers is 8; we now register 24 (frequency, obd,
      * can_capture, can_mode, gps, health, tasks, dtc, dtc_clear, dtc_simulate,
      * can_partner, can_sim_mode, vin, vin_read, ota_status, ota,
      * uds_scan_status, uds_scan_start, uds_addr_scan_status,
-     * uds_addr_scan_start). Without raising this, registrations past the
-     * 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL) instead of crashing,
-     * which is a much harder bug to notice -- endpoints just 404. */
-    config.max_uri_handlers = 24;
+     * uds_addr_scan_start, vwtp_scan_status, vwtp_scan_start,
+     * deep_scan_status, deep_scan_start). Without raising this,
+     * registrations past the 8th silently fail (ESP_ERR_HTTPD_HANDLERS_FULL)
+     * instead of crashing, which is a much harder bug to notice -- endpoints
+     * just 404. */
+    config.max_uri_handlers = 28;
     /* Default stack_size is 4096. can_capture_http_handler's local
      * `batch[CAN_CAPTURE_HTTP_BATCH]` array alone is now 128*32=4096 bytes --
      * the entire default stack, with nothing left for anything else in that
@@ -2930,6 +3647,26 @@ static void start_frequency_http_server(void)
         .method = HTTP_POST,
         .handler = uds_addr_scan_start_http_handler,
     };
+    httpd_uri_t vwtp_scan_status_uri = {
+        .uri = "/api/vwtp/scan",
+        .method = HTTP_GET,
+        .handler = vwtp_scan_status_http_handler,
+    };
+    httpd_uri_t vwtp_scan_start_uri = {
+        .uri = "/api/vwtp/scan",
+        .method = HTTP_POST,
+        .handler = vwtp_scan_start_http_handler,
+    };
+    httpd_uri_t deep_scan_status_uri = {
+        .uri = "/api/deepscan",
+        .method = HTTP_GET,
+        .handler = deep_scan_status_http_handler,
+    };
+    httpd_uri_t deep_scan_start_uri = {
+        .uri = "/api/deepscan",
+        .method = HTTP_POST,
+        .handler = deep_scan_start_http_handler,
+    };
 
     if (httpd_start(&http_server, &config) == ESP_OK) {
         httpd_register_uri_handler(http_server, &frequency_uri);
@@ -2952,6 +3689,10 @@ static void start_frequency_http_server(void)
         httpd_register_uri_handler(http_server, &uds_scan_start_uri);
         httpd_register_uri_handler(http_server, &uds_addr_scan_status_uri);
         httpd_register_uri_handler(http_server, &uds_addr_scan_start_uri);
+        httpd_register_uri_handler(http_server, &vwtp_scan_status_uri);
+        httpd_register_uri_handler(http_server, &vwtp_scan_start_uri);
+        httpd_register_uri_handler(http_server, &deep_scan_status_uri);
+        httpd_register_uri_handler(http_server, &deep_scan_start_uri);
         ESP_LOGI(TAG, "WiFi frequency API ready: POST /api/frequency");
         ESP_LOGI(TAG, "OBD monitor API ready: GET /api/obd");
         ESP_LOGI(TAG, "CAN capture API ready: GET /api/can?after=<sequence>");
@@ -2965,6 +3706,8 @@ static void start_frequency_http_server(void)
         ESP_LOGI(TAG, "OTA API ready: GET /api/ota (status), POST /api/ota (push new firmware image)");
         ESP_LOGI(TAG, "UDS scan API ready: GET /api/uds/scan (status/results), POST /api/uds/scan (req,resp,extended,did_start,did_end)");
         ESP_LOGI(TAG, "UDS address scan API ready: GET /api/uds/addrscan (status/results), POST /api/uds/addrscan (req_start,req_end,offset,extended)");
+        ESP_LOGI(TAG, "VWTP scan API ready: GET /api/vwtp/scan (status/results), POST /api/vwtp/scan (addr_start,addr_end,rx_id)");
+        ESP_LOGI(TAG, "Deep scan API ready: GET /api/deepscan (status/results), POST /api/deepscan (req_start,req_end,offset,extended)");
     }
 }
 
@@ -3278,6 +4021,14 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    /* Pick a deep scan or VWTP scan back up if the board reset (most likely
+     * a brownout under sustained CAN-TX load, a real and repeatedly
+     * observed failure mode -- see deep_scan_t's doc comment) while one was
+     * still in progress, instead of silently losing an unattended overnight
+     * run to a single crash partway through. */
+    deep_scan_resume_from_nvs();
+    vwtp_scan_resume_from_nvs();
 
     /* If this boot is into a freshly OTA-pushed image (ota_http_handler),
      * the bootloader marks it "pending verify" and will roll back to the
