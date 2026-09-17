@@ -392,3 +392,79 @@ of canbus ids from the gateway" concept, different car/generation).
   reachable without a security-access implementation (a separate, larger
   piece of work, common OEM lockdown for anti-theft-adjacent data
   specifically -- notable given this project's own purpose).
+
+## Update 2026-09-17 — real-car results: only the Gateway is reachable, by either method
+
+**Deep Scan built**: a new tool (`POST`/`GET /api/deepscan`, Record tab's
+"Deep scan" section) that combines the direct address-discovery sweep with
+an automatic identification-DID sweep (the ISO 14229-1 Annex F block,
+`0xF180`-`0xF1A0`) against every address that responds, so a hit gets
+identified immediately instead of requiring a manual follow-up DID sweep.
+Also given NVS-backed persistence: progress and results are saved as the
+scan runs and it resumes automatically at boot if the board resets
+mid-scan (see "brownout" below for why that turned out to matter).
+
+**A single frame passively observed while actually driving** (not from an
+explicit scan) suggested a possible new responder: request `0x78F` /
+response `0x7F9` replied `7F 10 31` (negative response to Diagnostic
+Session Control, NRC `0x31` requestOutOfRange) in a raw capture, despite
+`0x78F` being inside the already-fully-swept `0x700`-`0x7FF` range that
+previously found only the Gateway. Leading theory at the time: some
+modules (steering/wheel-speed/stability-adjacent) may only be awake while
+the car is actually moving, not just with ignition on. **This did not hold
+up**: two dedicated follow-up DID sweeps against `0x78F`/`0x7F9` (targeting
+the identification block specifically) while driving both got zero
+response of any kind -- not even the negative one seen before -- and a
+full Deep Scan across the entire `0x700`-`0x7FF` range (which necessarily
+includes `0x78F`) also found nothing there. The original hit looks, in
+retrospect, more likely to have been a corrupted/coincidental frame than a
+real module. Closed as a dead end.
+
+**Brownout during the VWTP scan, even on stable USB power**: a full VWTP
+sweep reliably crashed the board (`E BOD: Brownout detector was
+triggered` / `rst:0x3 SW_SYS_RESET`) partway through, repeatedly, live
+serial monitor confirmed -- notably, this happened even when powered from
+a PC's USB port, which had fully resolved the equivalent brownout for the
+plain address-discovery sweep back on 2026-09-15. Root cause of *why*
+VWTP draws enough more current to matter is still unclear (same request
+pacing, same CAN-ACK-starvation-on-no-response profile as the address
+sweep) -- worth a closer look if it recurs. Given the scan couldn't be
+trusted to finish, it was given the same NVS-backed resume mechanism as
+the Deep Scan (`vwtp_scan_resume_from_nvs`, called at boot) so an
+interrupted run picks back up on its own instead of needing a restart.
+
+**Clean, complete real-car results obtained same evening**:
+- **Deep Scan, full `0x700`-`0x7FF` sweep**: exactly one hit, the Gateway
+  (`0x710`) -- consistent with every earlier finding. Its own
+  auto-identification data is a working sanity check for the tool itself:
+  DID `0xF197` (systemNameOrEngineType) decoded to ASCII `"GW"`, `0xF193`
+  to `"Har"` (very likely **Harman**, a known VAG Tier-1 supplier for
+  gateway/infotainment modules), `0xF187` (vehicle manufacturer spare part
+  number) to `"3Q0"` (a real VAG part-number prefix). Known limitation:
+  DID values are truncated to 5 value bytes (8 total including the 3-byte
+  `0x62`/DID header) in this tool's current implementation, so real VAG
+  part numbers (usually 9-10 characters) are only showing their prefix --
+  worth widening if a future run needs the full string.
+- **VWTP scan, full `0x00`-`0xFF` sweep**: completed with zero resets this
+  particular run (so the new resume mechanism, while built and deployed,
+  didn't actually get exercised by a real crash this time) and found
+  **zero responses across the entire logical-address space**.
+
+**Where this leaves the research**: two independent, complete, clean
+sweeps -- one by direct CAN-ID addressing, one by VWTP 2.0's session-based
+scheme -- now agree that only the Gateway answers anything on this car's
+OBD-II-accessible bus segment. This is a meaningfully stronger negative
+result than either sweep alone (no longer "we didn't find the right
+addresses," but "neither addressing scheme this project knows about
+reaches anything but the Gateway"). Two directions worth considering next,
+neither yet attempted:
+1. Physically check the OBD-II connector pinout for DoIP (100BASE-T1
+   Ethernet, typically pins 1/8 in addition to the standard CAN pins 6/14)
+   -- this Fabia (VIN-decoded as Typ PJ / MQB-A0, see project memory) isn't
+   expected to have it based on every public MQB-A0-vs-MQB-Evo/MEB
+   reference found so far, but that's inference, not a direct check.
+2. Accept that body/comfort modules may simply not be reachable from the
+   OBD-II connector on this platform via any addressing scheme, and that
+   this project's anti-theft goals may be better served by the physical
+   immobilizer approach already scoped separately (starter-circuit relay)
+   rather than continuing to chase CAN-based body-module access.
