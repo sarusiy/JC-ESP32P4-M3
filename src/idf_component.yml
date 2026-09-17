@@ -1,4 +1,2 @@
 dependencies:
-  espressif/esp_tinyusb: "*"
-  espressif/esp_wifi_remote: "*"
-  espressif/esp_hosted: "^2.12.8"
+  espressif/led_strip: "^2.5.5"

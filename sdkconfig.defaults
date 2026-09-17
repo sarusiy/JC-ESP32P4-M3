@@ -1,85 +1,39 @@
-# The board is fitted with a 16 MB flash device.
+# Auto-target a fresh checkout to esp32s3 without requiring a manual
+# `idf.py set-target esp32s3` first.
+CONFIG_IDF_TARGET="esp32s3"
+
+# The N16R8 module: 16 MB flash, 8 MB Octal PSRAM.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
-
-# This board's actual silicon is chip revision v1.3, not the >=v3.0 silicon
-# ESP-IDF defaults to targeting. REV_MIN_100 alone is not enough: it's gated
-# behind SELECTS_REV_LESS_V3, so both must be set together or Kconfig falls
-# back to requiring rev >=v3.1 and the board refuses to flash/boot.
-CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_100=y
-
-# 400 MHz is not guaranteed on pre-rev3 chips and crashes this board
-# (assert failed: esp_clk_init) at boot; 360 MHz is the safe alternative.
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
 
 # Allow DEBUG-level logs to be compiled in (still hidden by default at
-# runtime) so the "ll 0" control-channel command can enable them live.
+# runtime) -- same reasoning as the P4 board's sdkconfig.
 # CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT is not set
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 CONFIG_LOG_COLORS=y
 
-# /api/tasks would like this for runtime task names, priorities, states, and
-# stack high-water marks, but it is deliberately left OFF here: enabling it on
-# this esp32p4 rev-<v3 board reduces the "RETENT_RAM" heap region enough to
-# shift which early-boot failure mode manifests (see PM_SLEEP_CLK_ICG_ENABLE
-# note below for the actual root cause). src/main.c's tasks_http_handler()
-# degrades gracefully (HTTP 501) when this is off, so it's left disabled here
-# as a safety margin rather than risking another RETENT_RAM squeeze.
-# CONFIG_FREERTOS_USE_TRACE_FACILITY is not set
-
-# This board never uses Light Sleep (CONFIG_PM_ENABLE is off), so the
-# PMU sleep-clock-ICG REGDMA retention feature this option enables is unused
-# dead weight. On this esp32p4 rev-<v3 chip + ESP-IDF v6.1-beta combo its
-# early-boot init is buggy and crash-loops the board every single boot
-# (`sleep_clock_icg_startup_init ... has failed (0x101)` / `assert failed:
-# entries_destroy ...`), before app_main() or any app code ever runs.
-# Disabling it excludes the faulty pmu_sleep_clock_icg.c from the build
-# entirely. Confirmed via 6x back-to-back hardware resets: zero crashes.
-# CONFIG_PM_SLEEP_CLK_ICG_ENABLE is not set
-
-# Make the USB-Serial/JTAG port (used for flashing/monitoring, e.g. COM3) the
-# primary console so it receives stdin too; the default UART0 console is
-# output-only for us here since nothing is wired to UART0's physical pins.
+# ESP32-S3 (like P4) has a native USB-Serial/JTAG peripheral separate from
+# its general-purpose USB OTG pins -- make it the console so flash/monitor
+# and stdin/stdout both work over the same port without needing the
+# onboard FTDI chip at all. Confirmed working pattern on the P4 board's
+# own sdkconfig; bring-up firmware's whole point right now is confirming
+# it also holds on this board.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
-# Enable TinyUSB CDC on the board's second (full-speed) USB-C port, used as
-# an independent control channel separate from the debug console above.
-CONFIG_TINYUSB_CDC_ENABLED=y
-
-# Hosted radio path (P4 host + onboard C6 coprocessor over SDIO).
-CONFIG_ESP_WIFI_REMOTE_ENABLED=y
-CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
-CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
-CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
-CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
-CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
-CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
-CONFIG_BT_ENABLED=y
-CONFIG_BT_CONTROLLER_DISABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-# CONFIG_BT_NIMBLE_TRANSPORT_UART is not set
-CONFIG_BT_BLE_ENABLED=y
-
-# OTA-capable partition table (see partitions.csv): two app slots so the
-# phone app can push a new firmware image over the board's own Wi-Fi
-# (POST /api/ota) instead of always needing a USB/PC visit. Rollback lets
-# the bootloader automatically revert to the previous image if a bad push
-# crash-loops -- the safety net that makes this acceptable to do away from
-# USB/JTAG. sdkconfig itself is gitignored (auto-generated), so these must
-# live here to survive a fresh checkout.
+# OTA-capable partition table (see partitions.csv) -- carried over from the
+# P4 board's design, sized for the same 16MB flash this module also has.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
-# Pinned because a from-scratch sdkconfig regeneration (done while verifying
-# the OTA settings above actually survive a fresh checkout) silently drifted
-# onto Picolibc + stricter orphan-sections-as-error instead of this project's
-# actual, verified-on-hardware toolchain choice -- Kconfig's own defaults for
-# these evidently moved since this sdkconfig was first generated. Pinning
-# keeps a fresh checkout building the same toolchain that's been tested,
-# rather than whatever ESP-IDF's current defaults happen to resolve to.
+# Pinned for the same reason as the P4 board's sdkconfig.defaults: keeps a
+# fresh checkout building the same toolchain choice that's actually been
+# tested, rather than whatever ESP-IDF's current Kconfig defaults resolve
+# to on a from-scratch config.
 CONFIG_LIBC_NEWLIB=y
 # CONFIG_LIBC_PICOLIBC is not set
 CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y

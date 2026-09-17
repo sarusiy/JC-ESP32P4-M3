@@ -102,13 +102,72 @@ isolated bench bus).
    changes, since it talks to the board purely over the same HTTP API —
    the whole point of porting the API surface unchanged in step 4.
 
-## Open questions
+## Open questions — resolved 2026-09-17 (bring-up)
 
-- Which of the two USB-C ports is native-USB vs. FTDI-UART, and does
-  flashing/monitoring work the same way as the P4 board's tooling
-  (`idf.py -p COMx flash monitor`) or need adjusting?
-- Final GPIO assignment for CAN TX/RX and GPS UART, avoiding strapping
-  pins (0, 3, 45, 46) and whatever pin drives the onboard RGB LED.
+A minimal bring-up firmware (`src/bringup_s3.c`, not the real application,
+see its own doc comment) was built and flashed to real hardware to answer
+the first two questions empirically instead of guessing from photos:
+
+- **RGB LED confirmed: GPIO48.** A vendor pinout diagram found for this
+  exact board labels it `SPICLK_P_RGB_LED`; bring-up firmware drove a
+  `led_strip` (WS2812, RMT backend) on GPIO48 cycling red/green/blue/off
+  every second, and this was visually confirmed against the real board.
+- **Which USB-C port works, and how flashing/monitoring actually behaves
+  on it — confirmed, but with real caveats, not the P4 board's
+  plug-and-play experience:**
+  - The boot log's reset reason reads `USB_UART_CHIP_RESET`, which is the
+    chip's own designation for a reset via the **native USB-Serial/JTAG**
+    peripheral (GPIO19/20) — i.e. the port labeled "ESP32-S3 Type-C USB &
+    OTG" on the vendor's labeled photo, not the CH343P/FTDI
+    "USB to Serial" port. The other (bridge-chip) port hasn't been tried.
+  - **Auto-reset-into-bootloader does not work on this port** (no working
+    auto-program circuit, or a timing mismatch with the tooling used) --
+    both `esptool`'s own `--before=default-reset` and plain opening the
+    port with `idf.py monitor` each independently kick the chip back to
+    running the app (or into an inconsistent state) instead of entering
+    download mode. **Working procedure instead**:
+    1. Manually enter download mode: hold **BOOT**, tap **RST** while
+       still holding BOOT, then release BOOT.
+    2. Flash **immediately** with esptool's own reset disabled --
+       `--before no-reset` -- e.g. (paths relative to `build/`):
+       `python -m esptool --chip esp32s3 -p COMx -b 460800 --before no-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0xf000 ota_data_initial.bin 0x20000 JC-ESP32S3-CAN.bin`
+       (`idf.py -p COMx flash` alone reliably fails with "No serial data
+       received" on this port, because its own default-reset attempt
+       interferes.)
+    3. **The COM port number itself changes between download mode and
+       normal running mode** (observed COM5 in one state, COM8 in the
+       other on the same physical connection) -- rescan
+       (`Get-WmiObject Win32_SerialPort` on Windows) right before each
+       flash/monitor attempt rather than assuming a fixed port number.
+    4. To see the running app's log output afterward: open
+       `idf.py -p COMx monitor` (this alone re-triggers download mode
+       again, same as step 1's symptom), then tap **RST** once while the
+       monitor is already connected and listening -- this boots normally
+       and the monitor picks up the app's log output without needing to
+       reconnect.
+  - Worth trying the other (CH343P/FTDI) port at some point -- it may
+    have a real auto-program circuit and make this whole dance
+    unnecessary, but the native-USB port above is a known-working
+    procedure so there was no need to chase that during bring-up.
+  - A separate, real build-environment bug hit during bring-up and fixed
+    along the way: the managed `espressif/led_strip` component (v2.5.5)'s
+    SPI backend (`led_strip_spi_dev.c`, unused here -- only the RMT
+    backend is) fails to compile against ESP-IDF v6.1-beta1 with
+    `MALLOC_CAP_DEFAULT`/`heap_caps_calloc` undeclared errors, because it
+    's missing an `esp_heap_caps.h` include the header reshuffling in this
+    beta IDF no longer provides transitively. Patched directly in
+    `managed_components/` (gitignored, so **this patch needs re-applying
+    after any fresh checkout / `idf.py reconfigure`** until either the
+    upstream component fixes it or this project switches to a hand-rolled
+    WS2812/RMT driver instead of the managed component).
+
+## Open questions still remaining
+
+- Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
+  actually free of conflicts once wired up for real -- chosen as safe,
+  non-strapping, non-USB, non-PSRAM general-purpose pins per the vendor
+  pinout diagram, but not yet physically tested with the SN65HVD230 or a
+  GPS module.
 - Whether to keep BLE-based board discovery + AP-only Wi-Fi (see
   [[project-ap-only-connectivity]]) unchanged, or reconsider now that
   there's no hosted co-processor link involved.
