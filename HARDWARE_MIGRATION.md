@@ -261,6 +261,79 @@ see the migration plan above -- but every piece of hardware this new
 board needs to replace the P4+C6+MCP2515 design has now been individually
 proven to work.
 
+## Known issues found after first-pass bring-up (2026-09-17 night, not yet fixed)
+
+**CAN went from working to silent, cause not yet found.** The first CAN
+test (see above) cleanly received real simulator frames. Later the same
+night, after a lot of physical handling (BOOT+RST button presses, full
+USB unplug/replugs, swapping between the two USB-C ports, and manually
+adding/moving termination resistors), CAN went completely silent --
+`twai_get_status_info()` shows `state=RUNNING` with **all error counters
+at zero** (not just zero frames -- zero `bus_err_count`, zero `rx_err`,
+etc.), which is the signature of no signal reaching the RX pin at all,
+not a signal-quality/termination problem. Briefly, right after adding a
+120Ω terminator to the S3 side, `rx_err`/`bus_err_count` became noisy and
+nonzero (real electrical activity, still zero successful frames) but then
+went back to silent and hasn't moved since. Code was checked and found
+unchanged/correct (same GPIO4/5 config, same `twai_driver_install`/
+`twai_start` calls, same receive loop, driver consistently reports
+healthy init) -- this points at a physical connection issue (likely a
+breadboard jumper wire not fully seated) rather than a software
+regression, but it hasn't been physically re-verified carefully (needs
+daylight/fresh eyes, not more guessing late at night). **Next step**:
+continuity-check every CAN wire individually with a multimeter (TXD, RXD,
+CANH, CANL, GND, 3.3V to the SN65HVD230) rather than just looking at it.
+
+**Native USB-Serial/JTAG port (the one used all night) needs manual
+BOOT+RST before every flash/monitor, confirmed structural, not
+timing** -- `esptool`'s own `--before=default-reset` and `idf.py
+monitor`'s port-open both independently kick the chip out of whatever
+state it's in instead of into bootloader mode reliably on this board.
+Tried the *other* USB-C port (CH343 USB-UART bridge chip, enumerates as
+"USB-Enhanced-SERIAL CH343" rather than the generic "USB Serial Device")
+as an alternative: **flashing works flawlessly with zero button presses**
+(true auto-reset, `idf.py flash` alone), but **monitoring over that same
+port reliably hangs** right after the ROM's first boot print
+(`call_start_cpu0`), even across a full board reset with clean `POWERON`
+(not brownout) -- looks like `idf_monitor.py`'s own DTR/RTS handling on
+port-open doesn't play well with however this board's CH343 auto-reset
+circuit is wired, though this wasn't root-caused. **Practical result**:
+flash via the CH343 port (COM9 in tonight's session, painless), monitor
+via the native port (COM8, needs the manual BOOT+RST dance) -- or just
+stay on the native port for both if not actively fighting the flash
+timeout. `tools/s3-serial-monitor.ps1`/`.bat` (this session) auto-detects
+whichever port is present and prints the relevant reminders either way.
+
+**Real bug found and fixed in `tools/s3-serial-monitor.ps1`**: single-
+match COM port detection could silently report "not found" even when
+exactly one real match existed, because a lone WMI (`Win32_SerialPort`)
+object doesn't reliably get PowerShell's synthetic `.Count` property the
+way plain objects/arrays do. Fixed by wrapping the pipeline in `@(...)`
+to force array semantics regardless of match count -- worth remembering
+as a general PowerShell gotcha, not just for this script.
+
+**DHCP fails on repeated Wi-Fi joins from the phone -- reproducible,
+not a one-off.** The very first Wi-Fi+BLE bring-up test succeeded fully
+end-to-end (app auto-connected, LED blink-rate control worked over HTTP,
+which requires a real IP). Later the same night, after many board
+resets/reflashes, the phone's BLE discovery of `JC-P4-C6` and the
+`WifiNetworkSpecifier` request both still fire correctly, and the ESP32
+AP's own Wi-Fi log confirms **the phone's station genuinely associates**
+(`wifi:station: <phone MAC> join, AID=1`) -- but no DHCP lease ever
+follows, and ~20 seconds later the phone disconnects on its own
+(`leave, ... reason = 3`, a client-initiated deauth) followed by the
+app's own 20s manual timeout (`Could not join board Wi-Fi` --
+`BoardLink.connectTimeoutRunnable`, since the 2-arg `requestNetwork()`
+overload has no built-in `onUnavailable()`). Reproduced 3+ times in a
+row, unaffected by toggling the phone's own Wi-Fi off/on. Not yet
+root-caused -- worth checking next time: whether lwIP's default AP DHCP
+server (`esp_netif_lwip: DHCP server started...`, seen once at boot but
+not re-logged per lease attempt) has a known issue with rapid repeated
+client join/leave cycles from the same MAC, and whether explicitly
+logging `IP_EVENT_AP_STAIPASSIGNED` (not currently done in
+`bringup_s3.c`) would help pin down whether the ESP32 side ever even
+offers a lease vs. the phone-side DHCP client itself stalling.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
