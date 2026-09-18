@@ -76,9 +76,6 @@ static const char *TAG = "bringup";
 #define WIFI_AP_SSID "CarTheftGuard-P4"
 #define WIFI_AP_PASSWORD "&Car1310"
 #define WIFI_AP_IP "192.168.4.1"
-/* Quarter-dBm units: 40 = 10 dBm. Same value JC-ESP32P4-M3 uses to reduce
- * Wi-Fi current spikes on USB-powered bench setups. */
-#define WIFI_MAX_TX_POWER_QDBM 40
 #define BLE_DEVICE_NAME "JC-P4-C6"
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
@@ -368,18 +365,10 @@ static void start_wifi_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Same mitigation as JC-ESP32P4-M3: cap TX power to reduce the current
-     * spike during a TX burst (DHCP OFFER/ACK is the first real TX-heavy
-     * Wi-Fi traffic after association -- unlike BLE advertising or plain
-     * 802.11 association, which stay quiet). This board's single shared
-     * regulator (see HARDWARE_MIGRATION.md) is more marginal than the P4's
-     * split CPU/C6 power domains, so this matters at least as much here. */
-    esp_err_t tx_power_err = esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
-    if (tx_power_err == ESP_OK) {
-        ESP_LOGI(TAG, "WiFi max TX power limited to %.2f dBm", WIFI_MAX_TX_POWER_QDBM / 4.0f);
-    } else {
-        ESP_LOGW(TAG, "WiFi TX power limit failed: %s", esp_err_to_name(tx_power_err));
-    }
+    /* TX power cap tried during the coex investigation and reverted --
+     * never proven to help (DHCP still failed with it on), and it's a
+     * real deviation from the exact e9ad195 config that was 100% reliable
+     * on the first bring-up test. Don't carry unproven changes forward. */
 
     ESP_LOGI(TAG, "SoftAP up: ssid=%s ip=%s", WIFI_AP_SSID, WIFI_AP_IP);
     start_http_server();
@@ -401,15 +390,12 @@ static void ble_start_advertising(void)
     struct ble_gap_adv_params adv = {0};
     adv.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    /* NimBLE's default (itvl_min/max left at 0) is "fast advertising"
-     * (~30-60ms interval) -- confirmed by testing to still starve WiFi's
-     * DHCP OFFER transmit on this chip's single shared 2.4GHz radio even
-     * with esp_coex_preference_set(ESP_COEX_PREFER_WIFI). Slow the
-     * interval way down (500-1000ms) to cut BLE's radio-time share --
-     * app discovery just takes a bit longer to see the board in a scan,
-     * which doesn't matter here. */
-    adv.itvl_min = 800;
-    adv.itvl_max = 1600;
+    /* Reverted back to NimBLE's plain default interval (itvl_min/max left
+     * at 0) -- matches the exact config from the first bring-up commit
+     * (e9ad195) that was 100% reliable. A slowed-down interval (800/1600)
+     * was tried during the coex investigation and never definitively
+     * proven to help (it didn't fix DHCP with BLE active either), so
+     * don't carry a deviation from the known-good config without reason. */
     rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, NULL, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE adv start failed: rc=%d", rc);
@@ -741,19 +727,18 @@ void app_main(void)
         ESP_LOGI(TAG, "led_strip init OK on GPIO%d", LED_GPIO_CANDIDATE);
     }
 
+    /* CAN+GPS together (not either alone, not BLE/WiFi coexistence --
+     * see HARDWARE_MIGRATION.md's corrected DHCP resolution) intermittently
+     * break Wi-Fi/BLE join reliability, root cause not yet pinned down
+     * further (likely a shared interrupt/timer/DMA resource conflict
+     * between the TWAI and UART drivers). Left both enabled here to match
+     * the real feature set; BoardLink.connectToBoardNetwork's automatic
+     * retry (added the same day) papers over the occasional lost join
+     * until the actual resource conflict is found and fixed. */
     start_can();
     start_gps();
     start_wifi_ap();
-    /* BLE deliberately NOT started -- confirmed by extensive testing that
-     * this chip's BT+WiFi coexistence breaks the SoftAP's DHCP OFFER
-     * transmit whenever the BT controller is initialized at all, even
-     * merely disabled (not actively advertising). See the "BLE+WiFi
-     * concurrency" note above wifi_ap_event_handler and
-     * HARDWARE_MIGRATION.md's DHCP section for the full investigation.
-     * Wi-Fi alone is 100% reliable (4/4+ in testing); re-enable start_ble()
-     * only once real app work redesigns discovery as BLE-then-WiFi
-     * (mutually exclusive), not concurrent. */
-    // start_ble();
+    start_ble();
 
     ESP_LOGI(TAG, "Blinking LED at the app-controlled rate (default %lu ms half-period) -- "
              "connect with the CarTheftGuard app and adjust it from the Control tab.",

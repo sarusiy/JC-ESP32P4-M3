@@ -439,6 +439,20 @@ since the process itself is worth remembering):
    design (BLE for discovery only, fully off during WiFi use), not
    something to run concurrently.
 
+## DHCP resolution corrected (2026-09-18 afternoon): it's CAN+GPS together, not BLE/WiFi coexistence
+
+**The user's sharp pushback was right, and the "BT/WiFi coexistence" diagnosis above was wrong.** After the coexistence writeup, the user asked directly: yesterday's exact commit (`e9ad195`, no CAN/GPS code at all) connected instantly and reliably -- so what does CAN+GPS actually have to do with the Wi-Fi/BLE join? That question led to a proper isolation test, checked out in a separate worktree (`git worktree add ../JC-ESP32S3-CAN-yesterday e9ad195`) so today's work stayed untouched:
+
+1. **Built and flashed `e9ad195` exactly as-is** on today's hardware/environment: connected on the very first attempt, no failures. Confirms the chip and environment are fine -- nothing rules out BLE+WiFi concurrency in general.
+2. Went back to today's full code and reverted two leftover, never-proven-to-help deviations from the coex investigation (BLE advertising interval slowed to 800/1600, WiFi TX power capped to 10dBm) back to the exact `e9ad195` values -- **still failed repeatedly**. Not a config-drift issue either.
+3. Disconnecting the CAN/GPS *wires* (tasks still created, just blocked on empty queues) -- **still failed**, which is what originally pointed (wrongly) at BLE/WiFi coexistence as the root cause, since blocked tasks consume ~0 CPU.
+4. The real test, prompted by the user asking specifically how CAN+GPS could affect Wi-Fi: **skip calling `start_can()`/`start_gps()` entirely** (not wires -- the peripheral driver installs themselves: `twai_driver_install`, `uart_driver_install`), keeping BLE+WiFi+all three HTTP handlers otherwise identical to today's code. Result: **3/3 reliable.**
+5. Isolated further: **CAN alone (GPS skipped): 3/3 reliable. GPS alone (CAN skipped): 3/3 reliable.** Only **both TWAI and UART drivers installed together** breaks Wi-Fi/BLE join reliability -- neither one alone is the problem.
+
+**Conclusion**: this is a specific resource contention between the TWAI and UART peripheral drivers when both are active simultaneously alongside WiFi+BLE -- almost certainly a shared interrupt allocation, GPTimer, or DMA-adjacent conflict that leaves too little real-time headroom for the WiFi/BLE stack once both peripherals are running, not a fundamental BT/WiFi radio-arbitration limit. **Not yet root-caused further** -- next step is to check what interrupt flags/priorities `twai_driver_install` and `uart_driver_install` request by default and whether explicitly assigning them non-conflicting `ESP_INTR_FLAG_*`/interrupt priorities (or pinning one driver's ISR to a specific core) resolves it. All the BLE-off/coex-preference/BT-controller-disable/advertising-interval mitigations documented in the section above this one were real work but were chasing the wrong root cause -- keep them as a record of what was ruled out, not as the explanation.
+
+`app_main()` currently has both `start_can()`/`start_gps()` calls live again (matching the shipped, committed state) -- the isolation testing above was done with them temporarily commented out one at a time and is not the state committed to the branch.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
