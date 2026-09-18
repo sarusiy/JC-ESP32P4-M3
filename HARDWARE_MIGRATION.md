@@ -453,9 +453,22 @@ since the process itself is worth remembering):
 
 6. **CPU core affinity tested and ruled out.** Both WiFi and NimBLE are explicitly pinned to CPU0 (`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`, `CONFIG_BT_NIMBLE_PINNED_TO_CORE_0`), and `app_main()` itself also runs pinned to CPU0 (`CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`) -- so calling `start_can()`/`start_gps()` directly from `app_main()` puts the TWAI/UART drivers' `esp_intr_alloc()`'d ISRs on the *same* core as WiFi/BLE's own interrupts. Moved both drivers' init (and their receive tasks) onto a helper task pinned to CPU1 (`sensors_init_on_core1()`/`sensors_init_task()` in `bringup_s3.c`) to test whether freeing CPU0 entirely fixes it -- **still failed identically**. CPU core placement is not the mechanism either.
 
-**Current state, not yet root-caused further**: GPS is temporarily disabled (`start_gps()` commented out inside `sensors_init_task`) so the known-good CAN-only config stays usable while this is investigated more -- verified end-to-end: real CAN frames confirmed via a direct `GET /api/can` query (thousands of valid frames, IDs matching the simulator), and the app's **Record** tab (which calls `fetchCanRaw()` -> `/api/can`) displays them live.
+**Interim state while this was open**: GPS was temporarily disabled so the known-good CAN-only config stayed usable -- verified end-to-end via a direct `GET /api/can` query (thousands of valid frames) and the app's **Record** tab.
 
 The CPU-affinity code (pinning to core 1) stays in place even though it didn't fix the conflict -- freeing CPU0 for WiFi/BLE is sound practice regardless, and it costs nothing to keep.
+
+## CAN+GPS/WiFi-BLE conflict: actually root-caused and fixed (2026-09-18 evening)
+
+7. **`esp_intr_dump()` ruled out interrupt-vector contention conclusively.** Added a call right after CAN+GPS+WiFi+BLE were all up: the dump showed TWAI and UART1 cleanly on CPU1 (int 2/3, level 1) with zero overlap against BLE's own interrupt (`RWBLE`, CPU0 int 23, level 3) -- confirming the CPU1 pinning from item 6 genuinely worked. (WiFi's own interrupt doesn't appear in this table at all -- it isn't tracked through the standard `esp_intr_alloc()` mechanism `esp_intr_dump()` reads.) Since the vectors were already provably non-overlapping, whatever was wrong couldn't be interrupt-vector allocation.
+8. **UART ISR frequency tested and ruled out.** Theorized that FreeRTOS SMP's cross-core critical-section spinlocks (not scoped per-core, unlike interrupt vectors) could still cause contention regardless of which core things run on, if GPS UART's ISR fires often enough. Raised `uart_set_rx_full_threshold()`/`uart_set_rx_timeout()` to cut ISR frequency -- **still failed identically**.
+9. **The user suggested searching for similar open-source ESP32-S3 projects combining TWAI+UART+WiFi+BLE.** That search surfaced [meshcore-dev/MeshCore#3439](https://github.com/meshcore-dev/MeshCore/issues/3439): "WiFi silently fails to connect when BLE is also active on ESP32-S3 boards without PSRAM," caused by internal-heap exhaustion (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is off by default, so WiFi/lwIP can only draw from internal RAM, never PSRAM, even when PSRAM is present and otherwise plentiful). That was the actual mechanism here too.
+10. **Confirmed and fixed by measurement.** Added a one-time post-init log of `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` and `heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)` right after CAN+GPS+WiFi+BLE init:
+    - CAN alone: 23KB free internal / 15KB largest contiguous block.
+    - **CAN+GPS: 14KB free internal / only 7.5KB largest contiguous block.**
+    - `s_can_capture[CAN_CAPTURE_CAPACITY]` (4096 frames, ~130KB) -- a plain static array -- was by far the single largest consumer of internal RAM in the whole firmware, present in both cases but leaving CAN alone already fairly tight; GPS's smaller additional allocations (1KB UART RX buffer, task stack, etc.) were enough to push fragmentation over the edge and intermittently starve WiFi's own TX buffer allocation for the DHCP OFFER.
+    - **Fix**: allocate `s_can_capture` from PSRAM instead (`heap_caps_calloc(..., MALLOC_CAP_SPIRAM)`) -- it's only touched from `can_receive_task`, a normal task context, so it never needed DMA/ISR-capable internal memory in the first place. Post-fix, CAN+GPS+WiFi+BLE together: **145KB free internal / 68KB largest contiguous block** -- back to a huge margin. Verified end-to-end, repeatedly: reliable Wi-Fi/BLE join, CAN data flowing (Record tab), OBD data flowing (Monitor tab), all simultaneously.
+
+**Real fix, not a workaround**: `start_can()`/`start_gps()` are both unconditionally enabled again in `app_main()`. Nothing about BLE, coex preference, TX power, advertising interval, or CPU affinity needed to change from ESP-IDF defaults in the end -- the actual bug was a plain, measurable internal-RAM budget problem caused by this bring-up firmware's own oversized static buffer, not anything about the chip, the coexistence stack, or ESP-IDF itself.
 
 ## `/api/obd` added -- Monitor tab now works, without porting the full active query engine
 
@@ -472,10 +485,6 @@ This only works because the simulator broadcasts unsolicited -- a real car won't
   non-strapping, non-USB, non-PSRAM general-purpose pins per the vendor
   pinout diagram, but not yet physically tested with the SN65HVD230 or a
   GPS module.
-- **The CAN+GPS/WiFi-BLE resource conflict root cause** (see the corrected
-  DHCP resolution above) -- CPU-core affinity was ruled out; still not
-  known what's actually contended (interrupt allocation, GPTimer, DMA).
-  GPS stays disabled until this is found and fixed.
 - **Port the full active `obd_query_task`** (PID request/response over
   CAN, multi-ECU disambiguation, DTC/VIN/UDS-scan triggers) -- needed for
   any real-car testing on this board; the current `/api/obd` only works

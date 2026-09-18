@@ -177,7 +177,17 @@ typedef struct {
 #define CAN_CAPTURE_HTTP_BATCH 128
 #define CAN_CAPTURE_RESPONSE_SIZE 24576
 
-static can_capture_frame_t s_can_capture[CAN_CAPTURE_CAPACITY];
+/* Allocated in PSRAM (see start_can()), not a static internal-RAM array --
+ * at CAN_CAPTURE_CAPACITY=4096 frames (~130KB) this was the single largest
+ * consumer of internal RAM in the whole firmware, and WiFi/lwIP can only
+ * use internal RAM (CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is off). Measured
+ * root cause of the CAN+GPS/WiFi-BLE conflict: internal heap after
+ * CAN+GPS+WiFi+BLE init was only 14KB free / 7.5KB largest contiguous
+ * block (vs. 23KB/15KB with CAN alone) -- tight enough that WiFi's own TX
+ * buffer allocation for the DHCP OFFER intermittently failed. This buffer
+ * doesn't need DMA/ISR access (only touched from can_receive_task, a
+ * normal task context), so PSRAM is a safe, effectively free fix. */
+static can_capture_frame_t *s_can_capture;
 static uint64_t s_can_capture_sequence;
 static portMUX_TYPE s_can_capture_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -737,6 +747,12 @@ static void start_gps(void)
 
 static void start_can(void)
 {
+    s_can_capture = heap_caps_calloc(CAN_CAPTURE_CAPACITY, sizeof(can_capture_frame_t), MALLOC_CAP_SPIRAM);
+    if (s_can_capture == NULL) {
+        ESP_LOGE(TAG, "CAN: failed to allocate %d-frame capture buffer in PSRAM", CAN_CAPTURE_CAPACITY);
+        return;
+    }
+
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
             CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
@@ -772,17 +788,16 @@ static void start_can(void)
     }
 }
 
-/* GPS temporarily disabled -- confirmed CAN+GPS together (not either
- * alone) break Wi-Fi/BLE reliability, root cause not yet found (moving
- * both to CPU1 didn't fix it either). Keeping the known-good CAN-only
- * config live so the app's own Monitor tab can be verified end-to-end
- * over real Wi-Fi while that's investigated further. Re-enable
- * start_gps() once the actual conflict is found and fixed. */
+/* CAN+GPS together used to break Wi-Fi/BLE reliability -- root-caused to
+ * internal-RAM exhaustion (see s_can_capture's doc comment), not CPU
+ * affinity or interrupt allocation (both tested and ruled out first).
+ * Fixed by moving the CAN capture buffer to PSRAM; both drivers run fine
+ * together now. */
 static void sensors_init_task(void *arg)
 {
     SemaphoreHandle_t done = (SemaphoreHandle_t)arg;
     start_can();
-    // start_gps();
+    start_gps();
     xSemaphoreGive(done);
     vTaskDelete(NULL);
 }
@@ -832,20 +847,22 @@ void app_main(void)
         ESP_LOGI(TAG, "led_strip init OK on GPIO%d", LED_GPIO_CANDIDATE);
     }
 
-    /* CAN+GPS together (not either alone) intermittently break Wi-Fi/BLE
-     * join reliability -- see HARDWARE_MIGRATION.md's corrected DHCP
-     * resolution. Leading theory being tested here: WiFi and BLE are both
-     * pinned to CPU0 (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0,
-     * CONFIG_BT_NIMBLE_PINNED_TO_CORE_0), and app_main() itself runs
-     * pinned to CPU0 too (CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0) -- so
-     * calling start_can()/start_gps() directly here puts the TWAI and
-     * UART drivers' esp_intr_alloc()'d ISRs on the SAME core as WiFi/BLE's
-     * own timing-critical interrupts. Running their init from a task
-     * pinned to CPU1 instead should move those ISRs off CPU0 entirely,
-     * leaving it free for WiFi/BLE. */
+    /* Runs start_can()/start_gps() from a task pinned to CPU1 rather than
+     * directly here (app_main() runs pinned to CPU0, same as WiFi/BLE --
+     * CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0/CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0/
+     * CONFIG_BT_NIMBLE_PINNED_TO_CORE_0). This turned out NOT to be why
+     * CAN+GPS together broke Wi-Fi/BLE (that was internal-RAM exhaustion,
+     * see s_can_capture's doc comment) -- kept anyway since freeing CPU0
+     * for WiFi/BLE is sound practice regardless and costs nothing. */
     sensors_init_on_core1();
     start_wifi_ap();
     start_ble();
+
+    ESP_LOGI(TAG, "=== post-init heap: free=%lu internal=%lu internal_8bit=%lu largest_internal_block=%lu ===",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     ESP_LOGI(TAG, "Blinking LED at the app-controlled rate (default %lu ms half-period) -- "
              "connect with the CarTheftGuard app and adjust it from the Control tab.",
