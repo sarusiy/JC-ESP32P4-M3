@@ -1,6 +1,6 @@
 idf_component_register(
 	SRCS "bringup_s3.c"
-	REQUIRES esp_driver_gpio led_strip spi_flash esp_wifi esp_netif esp_event esp_http_server nvs_flash bt driver esp_driver_uart
+	REQUIRES esp_driver_gpio led_strip spi_flash esp_wifi esp_netif esp_event esp_http_server nvs_flash bt driver esp_driver_uart esp_coex
 )
 # ESP-IDF v6.1-beta1's legacy driver/twai.h emits a #warning nudging
 # towards the new esp_twai.h API -- this project's default -Werror

@@ -33,9 +33,13 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
+#include "esp_bt.h"
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "led_strip.h"
@@ -72,6 +76,9 @@ static const char *TAG = "bringup";
 #define WIFI_AP_SSID "CarTheftGuard-P4"
 #define WIFI_AP_PASSWORD "&Car1310"
 #define WIFI_AP_IP "192.168.4.1"
+/* Quarter-dBm units: 40 = 10 dBm. Same value JC-ESP32P4-M3 uses to reduce
+ * Wi-Fi current spikes on USB-powered bench setups. */
+#define WIFI_MAX_TX_POWER_QDBM 40
 #define BLE_DEVICE_NAME "JC-P4-C6"
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
@@ -274,6 +281,7 @@ static esp_err_t can_capture_http_handler(httpd_req_t *request)
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server start failed");
@@ -300,6 +308,35 @@ static void start_http_server(void)
     ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>");
 }
 
+/* BLE+WiFi concurrency was tested exhaustively and abandoned -- see
+ * HARDWARE_MIGRATION.md's DHCP section for the full record. Nothing short
+ * of BLE never being initialized at all (not paused, not merely disabled)
+ * gave reliable DHCP: esp_coex_preference_set(ESP_COEX_PREFER_WIFI), a
+ * much slower advertising interval, pausing just the GAP advertisement,
+ * and even a full esp_bt_controller_disable() all still lost the DHCP
+ * OFFER transmit on every retry once a WiFi station associated. Real
+ * porting work should treat BLE and this board's WiFi AP as mutually
+ * exclusive by design (BLE for discovery only, fully off during WiFi use)
+ * rather than trying to run both concurrently on this chip's single
+ * shared 2.4GHz radio. */
+static void wifi_ap_event_handler(void *arg, esp_event_base_t event_base,
+                                   int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *evt = (wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI(TAG, "WIFI_EVENT_AP_STACONNECTED: mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%d",
+                 evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5], evt->aid);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *evt = (wifi_event_ap_stadisconnected_t *)event_data;
+        ESP_LOGI(TAG, "WIFI_EVENT_AP_STADISCONNECTED: mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%d",
+                 evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5], evt->aid);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+        ip_event_ap_staipassigned_t *evt = (ip_event_ap_staipassigned_t *)event_data;
+        ESP_LOGI(TAG, "IP_EVENT_AP_STAIPASSIGNED: DHCP leased " IPSTR " to mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                 IP2STR(&evt->ip), evt->mac[0], evt->mac[1], evt->mac[2], evt->mac[3], evt->mac[4], evt->mac[5]);
+    }
+}
+
 static void start_wifi_ap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -308,6 +345,8 @@ static void start_wifi_ap(void)
         ESP_LOGE(TAG, "WiFi AP netif create failed");
         return;
     }
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_ap_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, &wifi_ap_event_handler, NULL));
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -329,6 +368,19 @@ static void start_wifi_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* Same mitigation as JC-ESP32P4-M3: cap TX power to reduce the current
+     * spike during a TX burst (DHCP OFFER/ACK is the first real TX-heavy
+     * Wi-Fi traffic after association -- unlike BLE advertising or plain
+     * 802.11 association, which stay quiet). This board's single shared
+     * regulator (see HARDWARE_MIGRATION.md) is more marginal than the P4's
+     * split CPU/C6 power domains, so this matters at least as much here. */
+    esp_err_t tx_power_err = esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
+    if (tx_power_err == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi max TX power limited to %.2f dBm", WIFI_MAX_TX_POWER_QDBM / 4.0f);
+    } else {
+        ESP_LOGW(TAG, "WiFi TX power limit failed: %s", esp_err_to_name(tx_power_err));
+    }
+
     ESP_LOGI(TAG, "SoftAP up: ssid=%s ip=%s", WIFI_AP_SSID, WIFI_AP_IP);
     start_http_server();
 }
@@ -349,6 +401,15 @@ static void ble_start_advertising(void)
     struct ble_gap_adv_params adv = {0};
     adv.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    /* NimBLE's default (itvl_min/max left at 0) is "fast advertising"
+     * (~30-60ms interval) -- confirmed by testing to still starve WiFi's
+     * DHCP OFFER transmit on this chip's single shared 2.4GHz radio even
+     * with esp_coex_preference_set(ESP_COEX_PREFER_WIFI). Slow the
+     * interval way down (500-1000ms) to cut BLE's radio-time share --
+     * app discovery just takes a bit longer to see the board in a scan,
+     * which doesn't matter here. */
+    adv.itvl_min = 800;
+    adv.itvl_max = 1600;
     rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, NULL, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE adv start failed: rc=%d", rc);
@@ -623,8 +684,24 @@ static void start_can(void)
         ESP_LOGE(TAG, "twai_start failed: %s", esp_err_to_name(err));
         return;
     }
-    ESP_LOGI(TAG, "CAN ready: TX=GPIO%d RX=GPIO%d 500kbps", CAN_TX_GPIO, CAN_RX_GPIO);
-    xTaskCreate(can_receive_task, "can_rx", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "CAN ready: TX=GPIO%d RX=GPIO%d 500kbps, free heap=%lu (internal=%lu)",
+             CAN_TX_GPIO, CAN_RX_GPIO, (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    /* 2026-09-18 morning: after adding GPS/CAN-capture/HTTP, one boot showed
+     * "CAN ready" print but then NEVER logged a single can_receive_task
+     * line again (not even a "no frames" timeout, which normally fires
+     * every ~1s) -- looks like this xTaskCreate silently failed (returned
+     * pdFAIL, task never actually runs) rather than a wiring problem, since
+     * a genuinely running receive task logs *something* every second
+     * regardless of what's on the wire. Checking the return value and
+     * free heap here to catch that precisely instead of guessing. */
+    BaseType_t created = xTaskCreate(can_receive_task, "can_rx", 4096, NULL, 5, NULL);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "CAN: xTaskCreate FAILED (result=%d) -- can_receive_task never started. "
+                 "Free heap=%lu internal=%lu", (int)created,
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }
 
 void app_main(void)
@@ -667,7 +744,16 @@ void app_main(void)
     start_can();
     start_gps();
     start_wifi_ap();
-    start_ble();
+    /* BLE deliberately NOT started -- confirmed by extensive testing that
+     * this chip's BT+WiFi coexistence breaks the SoftAP's DHCP OFFER
+     * transmit whenever the BT controller is initialized at all, even
+     * merely disabled (not actively advertising). See the "BLE+WiFi
+     * concurrency" note above wifi_ap_event_handler and
+     * HARDWARE_MIGRATION.md's DHCP section for the full investigation.
+     * Wi-Fi alone is 100% reliable (4/4+ in testing); re-enable start_ble()
+     * only once real app work redesigns discovery as BLE-then-WiFi
+     * (mutually exclusive), not concurrent. */
+    // start_ble();
 
     ESP_LOGI(TAG, "Blinking LED at the app-controlled rate (default %lu ms half-period) -- "
              "connect with the CarTheftGuard app and adjust it from the Control tab.",

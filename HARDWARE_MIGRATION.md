@@ -350,6 +350,95 @@ logging `IP_EVENT_AP_STAIPASSIGNED` (not currently done in
 `bringup_s3.c`) would help pin down whether the ESP32 side ever even
 offers a lease vs. the phone-side DHCP client itself stalling.
 
+## CAN and DHCP resolved (2026-09-18 morning/day) -- the "unifying power theory" above was wrong
+
+**CAN was never actually broken -- a logging blind spot, not a hardware bug.**
+The user's own power/voltage/connection checks that morning (3.3V rail
+confirmed good, ~60Ω across CAN_H/CAN_L with no extra resistor -- the
+SN65HVD230 module has a **fixed onboard 120Ω terminator, not a
+jumper-controlled one**, so 60Ω total from two in parallel is the
+*correct* healthy reading, no extra resistor needed) turned out to be
+enough on their own. The real issue: `can_receive_task`'s success branch
+called `capture_can_frame()` completely silently on `err == ESP_OK`
+(matching the original P4 design) -- so a CAN bus receiving continuously
+with zero timeouts produces **zero log output**, indistinguishable from a
+hung task by log inspection alone. A temporary success-branch
+`ESP_LOGI` (added, confirmed the flood of real `0x120`/`0x180`/`0x220`
+frames, then removed again) proved CAN was working the whole time that
+morning; last night's genuine `rx_err`/timeout evidence was real at the
+time, just not still true by morning.
+
+**DHCP was a real, deep bug -- fully root-caused, not just worked around.**
+The investigation (many hours, many dead ends, documented here in full
+since the process itself is worth remembering):
+1. Disconnecting the CAN RX wire entirely ruled out CAN-flood/CPU-
+   contention as a cause -- DHCP still failed identically.
+2. Adding `WIFI_EVENT_AP_STACONNECTED`/`STADISCONNECTED`/
+   `IP_EVENT_AP_STAIPASSIGNED` logging to `bringup_s3.c` proved the
+   ESP32 side's DHCP server **never** completed a lease -- the phone
+   (and, tested separately, a plain PC Wi-Fi client with no app
+   involved) associates at the 802.11 level but the DHCP handshake
+   itself always failed.
+3. Enabling lwIP's `DHCPS_DEBUG` (a build-time flag in
+   `components/lwip/apps/dhcpserver/dhcpserver.c`, off by default, patched
+   directly into the ESP-IDF install like the `led_strip` fix -- also hit
+   and fixed a real pre-existing format-string bug in that debug code,
+   `%x` against a `u32_t` arg, needs an `(unsigned int)` cast to build
+   under `-Werror=format`) showed the **exact** failure point: the DHCP
+   server correctly receives and parses the client's DISCOVER, correctly
+   builds a 548-byte OFFER packet, but `udp_sendto()` fails with
+   `ffffffff` (-1) on *every single attempt*, and the client just
+   retransmits DISCOVER into the same wall repeatedly until it gives up.
+   That -1 is lwIP's `ERR_MEM`, but it's not really a memory error --
+   `wifi_transmit()` in `components/esp_wifi/src/wifi_netif.c` passes
+   `esp_wifi_internal_tx()`'s raw `esp_err_t` straight through as the
+   netif's `err_t` return, and `ESP_FAIL` (-1) happens to collide
+   numerically with `ERR_MEM` (also -1) -- so the log is technically
+   misleading. The real failure is a generic low-level WiFi TX rejection.
+4. **Confirmed NOT an ESP-IDF v6.1-beta1 regression**: built and ran the
+   identical code against stable ESP-IDF **v5.5.0** (already installed at
+   `C:\Users\yossi\.espressif\frameworks\esp-idf-v5.5`, just needed its
+   toolchain installed via `install.ps1 esp32s3`) and hit the exact same
+   intermittent failure there too -- ruling out "it's just a beta bug."
+   (v5.5 did initially surface two *separate*, now-fixed bugs of its own
+   on the very first successful DHCP lease: a `netconn_alloc: undefined
+   netconn_type` assert from a too-small `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`
+   -- stock default 3072 is marginal for lwIP's TCP/IP task in an `-Og`
+   build with a deep accept→tcp_process→tcp_input→ip4_input call chain,
+   bumped to 8192 -- and after that, a corrupted-backtrace FreeRTOS
+   scheduler crash from the httpd task's own default 4096-byte stack,
+   fixed by setting `config.stack_size = 8192` on `HTTPD_DEFAULT_CONFIG()`.
+   `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK` was also turned on
+   permanently as a low-cost precise-overflow diagnostic for next time.)
+5. **Root cause: BT/WiFi radio coexistence**, confirmed by isolation
+   testing. This chip has one shared 2.4GHz radio between BLE and WiFi.
+   With BLE advertising fully disabled (`start_ble()` never called),
+   manual Wi-Fi join/DHCP succeeded **4/4** and later **3/3** across two
+   separate clean-boot test sessions -- fully reliable. With BLE running
+   at all, DHCP failed intermittently to consistently. Multiple standard
+   mitigations were tried and **all failed** to fix it while BLE stayed
+   active: `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` (biasing
+   arbitration toward WiFi), slowing NimBLE's advertising interval from
+   the ~30-60ms "fast" default to 500-1000ms (`adv.itvl_min/max`), pausing
+   just the GAP advertisement (`ble_gap_adv_stop()`) while a WiFi station
+   is associated, and even a full `esp_bt_controller_disable()` (not just
+   pausing advertising -- confirmed via log the disable call itself
+   succeeded, `ESP_OK`, and DHCP still failed identically on every retry).
+   Only BLE never being initialized at all removes the contention -- a
+   controller that's disabled-but-still-initialized apparently leaves
+   some coexistence-arbitration state registered with the WiFi driver
+   that a plain `disable()` doesn't clear. The next escalation (a full
+   `esp_bt_controller_deinit()`/re-`init()` cycle around every WiFi
+   connect/disconnect) was deliberately **not attempted** -- real risk of
+   crashing NimBLE's host stack, which isn't designed for its controller
+   to disappear and reappear underneath it, for an uncertain payoff.
+   **Decision (discussed with the user): stop chasing BLE+WiFi
+   concurrency on this chip.** `start_ble()` is commented out in
+   `app_main()` with a comment explaining why. Real application porting
+   should treat BLE and this board's WiFi AP as mutually exclusive by
+   design (BLE for discovery only, fully off during WiFi use), not
+   something to run concurrently.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are
@@ -357,9 +446,13 @@ offers a lease vs. the phone-side DHCP client itself stalling.
   non-strapping, non-USB, non-PSRAM general-purpose pins per the vendor
   pinout diagram, but not yet physically tested with the SN65HVD230 or a
   GPS module.
-- Whether to keep BLE-based board discovery + AP-only Wi-Fi (see
-  [[project-ap-only-connectivity]]) unchanged, or reconsider now that
-  there's no hosted co-processor link involved.
+- **BLE-based discovery needs a redesign for this board**: confirmed BLE
+  and this board's WiFi AP can't run concurrently reliably (see the DHCP
+  resolution above) -- the P4 board's hosted-co-processor design didn't
+  have this problem since the C6 chip's radio was separate from the P4's
+  own CPU. Options for real porting: BLE for a brief discovery-only
+  window before WiFi starts (not overlapping), or drop BLE entirely for
+  a different presence/pairing mechanism.
 - Power/brownout behavior on this new board under the same CAN-TX-heavy
   scans that caused problems on the P4 board — worth deliberately
   re-running the same stress scenarios (full address sweep, VWTP sweep)

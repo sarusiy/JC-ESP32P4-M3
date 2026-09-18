@@ -46,3 +46,17 @@ CONFIG_LIBC_NEWLIB=y
 CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
 # CONFIG_COMPILER_ORPHAN_SECTIONS_ERROR is not set
 CONFIG_FREERTOS_IN_IRAM=y
+
+# Stock default (3072) is marginal for the lwIP TCP/IP task in an -Og
+# (unoptimized) build with a deep protocol call chain (httpd accept ->
+# tcp_process -> tcp_input -> ip4_input -> ethernet_input). Bumped after a
+# "netconn_alloc: undefined netconn_type" assert (a corrupted struct field,
+# classic stack-overflow symptom) hit on the very first incoming HTTP
+# connection.
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=8192
+
+# Precise, immediately-named stack-overflow detection (hardware watchpoint
+# at the end of each task's stack) -- the default canary check wasn't
+# catching an overflow that crashed inside the FreeRTOS scheduler itself
+# with a corrupted backtrace, right after the httpd stack size fix above.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
