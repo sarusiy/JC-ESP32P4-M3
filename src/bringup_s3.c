@@ -103,6 +103,57 @@ static gps_state_t s_gps_state;
 static portMUX_TYPE s_gps_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_gps_log_us;
 
+/* GET /api/obd -- same JSON contract as JC-ESP32P4-M3's obd_http_handler,
+ * but populated passively: the simulator broadcasts engine/vehicle state
+ * unsolicited on 0x120/0x180 every 20/50ms regardless of any active OBD-II
+ * request (see JC-ESP32P4-M3's decode_engine_broadcast/
+ * decode_vehicle_broadcast, ported verbatim below), so no CAN TX or active
+ * Mode 01 polling is needed to drive the app's Monitor tab against the
+ * simulator. supported_pids/supported_pids_2 stay 0 -- those only come
+ * from an active PID 0x00/0x20 request, not implemented here. */
+typedef struct {
+    uint32_t supported_pids;
+    uint32_t supported_pids_2;
+    int coolant_c;
+    uint16_t rpm;
+    uint8_t speed_kmh;
+    uint8_t throttle_pct;
+} obd_state_t;
+
+#define CAN_ID_ENGINE_STATE 0x120
+#define CAN_ID_VEHICLE_STATE 0x180
+
+static obd_state_t s_obd_state;
+static portMUX_TYPE s_obd_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void decode_engine_broadcast(const uint8_t *data, uint8_t dlc)
+{
+    if (dlc < 4) {
+        return;
+    }
+    uint16_t rpm_raw = ((uint16_t)data[0] << 8) | data[1];
+    int coolant_c = (int)data[2] - 40;
+    uint8_t throttle_pct = (uint8_t)((uint16_t)data[3] * 100u / 255u);
+
+    portENTER_CRITICAL(&s_obd_lock);
+    s_obd_state.rpm = rpm_raw / 4;
+    s_obd_state.coolant_c = coolant_c;
+    s_obd_state.throttle_pct = throttle_pct;
+    portEXIT_CRITICAL(&s_obd_lock);
+}
+
+static void decode_vehicle_broadcast(const uint8_t *data, uint8_t dlc)
+{
+    if (dlc < 2) {
+        return;
+    }
+    uint16_t speed_centi_kmh = ((uint16_t)data[0] << 8) | data[1];
+
+    portENTER_CRITICAL(&s_obd_lock);
+    s_obd_state.speed_kmh = (uint8_t)(speed_centi_kmh / 100);
+    portEXIT_CRITICAL(&s_obd_lock);
+}
+
 /* GET /api/can ring buffer + JSON contract, same idea -- see
  * JC-ESP32P4-M3's can_capture_frame_t/can_capture_http_handler. Unlike
  * that board, extended/rtr here reflect the *real* flags from
@@ -144,6 +195,12 @@ static void capture_can_frame(const twai_message_t *message)
     frame->dlc = message->data_length_code > 8 ? 8 : message->data_length_code;
     memcpy(frame->data, message->data, frame->dlc);
     portEXIT_CRITICAL(&s_can_capture_lock);
+
+    if (message->identifier == CAN_ID_ENGINE_STATE) {
+        decode_engine_broadcast(message->data, frame->dlc);
+    } else if (message->identifier == CAN_ID_VEHICLE_STATE) {
+        decode_vehicle_broadcast(message->data, frame->dlc);
+    }
 }
 
 /* Same parsing/response contract as JC-ESP32P4-M3's apply_freq_command --
@@ -185,6 +242,24 @@ static esp_err_t frequency_http_handler(httpd_req_t *request)
 }
 
 /* JSON contract copied verbatim from JC-ESP32P4-M3's gps_http_handler. */
+/* JSON contract copied verbatim from JC-ESP32P4-M3's obd_http_handler
+ * (see the obd_state_t doc comment for what's populated vs. left at 0). */
+static esp_err_t obd_http_handler(httpd_req_t *request)
+{
+    obd_state_t state;
+    portENTER_CRITICAL(&s_obd_lock);
+    state = s_obd_state;
+    portEXIT_CRITICAL(&s_obd_lock);
+    char response[224];
+    snprintf(response, sizeof(response),
+             "{\"supported_pids\":\"%08lx\",\"supported_pids_2\":\"%08lx\",\"coolant_c\":%d,\"rpm\":%u,\"speed_kmh\":%u,\"throttle_pct\":%u}",
+             (unsigned long)state.supported_pids, (unsigned long)state.supported_pids_2,
+             state.coolant_c, state.rpm, state.speed_kmh, state.throttle_pct);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static esp_err_t gps_http_handler(httpd_req_t *request)
 {
     gps_state_t state;
@@ -300,10 +375,16 @@ static void start_http_server(void)
         .method = HTTP_GET,
         .handler = can_capture_http_handler,
     };
+    httpd_uri_t obd_uri = {
+        .uri = "/api/obd",
+        .method = HTTP_GET,
+        .handler = obd_http_handler,
+    };
     httpd_register_uri_handler(server, &frequency_uri);
     httpd_register_uri_handler(server, &gps_uri);
     httpd_register_uri_handler(server, &can_uri);
-    ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>");
+    httpd_register_uri_handler(server, &obd_uri);
+    ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>, GET /api/obd");
 }
 
 /* BLE+WiFi concurrency was tested exhaustively and abandoned -- see

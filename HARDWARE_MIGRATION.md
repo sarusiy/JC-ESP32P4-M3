@@ -453,9 +453,17 @@ since the process itself is worth remembering):
 
 6. **CPU core affinity tested and ruled out.** Both WiFi and NimBLE are explicitly pinned to CPU0 (`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`, `CONFIG_BT_NIMBLE_PINNED_TO_CORE_0`), and `app_main()` itself also runs pinned to CPU0 (`CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`) -- so calling `start_can()`/`start_gps()` directly from `app_main()` puts the TWAI/UART drivers' `esp_intr_alloc()`'d ISRs on the *same* core as WiFi/BLE's own interrupts. Moved both drivers' init (and their receive tasks) onto a helper task pinned to CPU1 (`sensors_init_on_core1()`/`sensors_init_task()` in `bringup_s3.c`) to test whether freeing CPU0 entirely fixes it -- **still failed identically**. CPU core placement is not the mechanism either.
 
-**Current state, not yet root-caused further**: GPS is temporarily disabled (`start_gps()` commented out inside `sensors_init_task`) so the known-good CAN-only config stays usable while this is investigated more -- verified end-to-end: real CAN frames confirmed via a direct `GET /api/can` query (thousands of valid frames, IDs matching the simulator), and the app's **Record** tab (which calls `fetchCanRaw()` -> `/api/can`) displays them live. The app's **Monitor** tab, by contrast, calls `fetchObdData()` -> `GET /api/obd`, which was never ported to `bringup_s3.c` at all (unrelated to the CAN+GPS conflict -- `/api/obd` doesn't exist yet, 404s every poll) -- porting a compatible active OBD-II query loop (see `obd_query_task` in `JC-ESP32P4-M3/src/main.c`, several hundred lines: PID request/response over CAN, multi-ECU disambiguation, etc.) is the next real feature-porting task, tracked separately from the CAN+GPS/WiFi conflict above.
+**Current state, not yet root-caused further**: GPS is temporarily disabled (`start_gps()` commented out inside `sensors_init_task`) so the known-good CAN-only config stays usable while this is investigated more -- verified end-to-end: real CAN frames confirmed via a direct `GET /api/can` query (thousands of valid frames, IDs matching the simulator), and the app's **Record** tab (which calls `fetchCanRaw()` -> `/api/can`) displays them live.
 
 The CPU-affinity code (pinning to core 1) stays in place even though it didn't fix the conflict -- freeing CPU0 for WiFi/BLE is sound practice regardless, and it costs nothing to keep.
+
+## `/api/obd` added -- Monitor tab now works, without porting the full active query engine
+
+The app's **Monitor** tab calls `fetchObdData()` -> `GET /api/obd`, which didn't exist in `bringup_s3.c` at all (unrelated to the CAN+GPS conflict above -- just never ported, 404d every poll). The P4's real `obd_http_handler` is fed by `obd_query_task`, an active engine that transmits Mode 01 PID requests over CAN and waits for responses (several hundred lines: request/response queueing, multi-ECU disambiguation, DTC/VIN/UDS-scan triggers) -- real feature-porting work, and out of scope for bring-up code.
+
+**Shortcut that works for the simulator specifically**: `ArdunioUsbBridgeToCan` already broadcasts engine/vehicle state *unsolicited* on `0x120` (every 20ms) and `0x180` (every 50ms) regardless of any active OBD-II request -- this is exactly what `JC-ESP32P4-M3`'s `decode_engine_broadcast`/`decode_vehicle_broadcast` already decode into the same `obd_state_t` fields Mode 01 PID responses would. Ported those two functions verbatim into `bringup_s3.c`, hooked into `capture_can_frame()` (checks `message->identifier` against `CAN_ID_ENGINE_STATE`/`CAN_ID_VEHICLE_STATE`, decodes if it matches), and added `obd_http_handler`/`GET /api/obd` with the same JSON contract as the P4. No CAN TX, no request/response queue, no active polling needed. `supported_pids`/`supported_pids_2` stay `0` (those only come from an active PID 0x00/0x20 request) -- everything else (RPM, speed, coolant, throttle) updates live. Verified end-to-end: app connects, Monitor tab shows live data.
+
+This only works because the simulator broadcasts unsolicited -- a real car won't, so this is explicitly a simulator-only shortcut. The full active `obd_query_task` port (needed for any real-car testing on this board) is still open, tracked below.
 
 ## Open questions still remaining
 
@@ -464,13 +472,14 @@ The CPU-affinity code (pinning to core 1) stays in place even though it didn't f
   non-strapping, non-USB, non-PSRAM general-purpose pins per the vendor
   pinout diagram, but not yet physically tested with the SN65HVD230 or a
   GPS module.
-- **BLE-based discovery needs a redesign for this board**: confirmed BLE
-  and this board's WiFi AP can't run concurrently reliably (see the DHCP
-  resolution above) -- the P4 board's hosted-co-processor design didn't
-  have this problem since the C6 chip's radio was separate from the P4's
-  own CPU. Options for real porting: BLE for a brief discovery-only
-  window before WiFi starts (not overlapping), or drop BLE entirely for
-  a different presence/pairing mechanism.
+- **The CAN+GPS/WiFi-BLE resource conflict root cause** (see the corrected
+  DHCP resolution above) -- CPU-core affinity was ruled out; still not
+  known what's actually contended (interrupt allocation, GPTimer, DMA).
+  GPS stays disabled until this is found and fixed.
+- **Port the full active `obd_query_task`** (PID request/response over
+  CAN, multi-ECU disambiguation, DTC/VIN/UDS-scan triggers) -- needed for
+  any real-car testing on this board; the current `/api/obd` only works
+  against the simulator's unsolicited broadcasts (see above).
 - Power/brownout behavior on this new board under the same CAN-TX-heavy
   scans that caused problems on the P4 board — worth deliberately
   re-running the same stress scenarios (full address sweep, VWTP sweep)
