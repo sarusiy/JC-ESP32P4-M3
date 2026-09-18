@@ -54,6 +54,12 @@
 
 static const char *TAG = "bringup";
 
+/* Forward declarations -- can_mode_http_handler (defined well before
+ * can_set_mode) and start_can (which starts obd_query_task before that
+ * task's own definition later in the file) both need these. */
+static void can_set_mode(bool passive);
+static void obd_query_task(void *arg);
+
 #define LED_GPIO_CANDIDATE 48
 /* First real test of the native TWAI (CAN) controller -- the whole point
  * of this hardware migration (see HARDWARE_MIGRATION.md's "Why change
@@ -103,14 +109,15 @@ static gps_state_t s_gps_state;
 static portMUX_TYPE s_gps_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_gps_log_us;
 
-/* GET /api/obd -- same JSON contract as JC-ESP32P4-M3's obd_http_handler,
- * but populated passively: the simulator broadcasts engine/vehicle state
- * unsolicited on 0x120/0x180 every 20/50ms regardless of any active OBD-II
- * request (see JC-ESP32P4-M3's decode_engine_broadcast/
- * decode_vehicle_broadcast, ported verbatim below), so no CAN TX or active
- * Mode 01 polling is needed to drive the app's Monitor tab against the
- * simulator. supported_pids/supported_pids_2 stay 0 -- those only come
- * from an active PID 0x00/0x20 request, not implemented here. */
+/* GET /api/obd -- same JSON contract as JC-ESP32P4-M3's obd_http_handler.
+ * Populated two ways now: passively, from the simulator's unsolicited
+ * engine/vehicle broadcasts on 0x120/0x180 (decode_engine_broadcast/
+ * decode_vehicle_broadcast below -- works with zero CAN TX, so it's always
+ * live even in Passive mode or against a quiet bus), and actively, from
+ * real Mode 01 PID polling once obd_query_task is running (see below --
+ * needed against a real car, which won't broadcast unsolicited data the
+ * way the simulator does). supported_pids/supported_pids_2 only ever come
+ * from the active path (PID 0x00/0x20). */
 typedef struct {
     uint32_t supported_pids;
     uint32_t supported_pids_2;
@@ -125,6 +132,129 @@ typedef struct {
 
 static obd_state_t s_obd_state;
 static portMUX_TYPE s_obd_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* --- Active OBD-II / UDS engine, ported from JC-ESP32P4-M3 (see that
+ * file's equivalent structs/functions for the original doc comments this
+ * was adapted from). Only the pieces needed for real-car testing: dual-
+ * scheme (11-bit/29-bit) Mode 01 polling, simulator/real-car partner
+ * detection, and a configurable Deep Scan (UDS session + DID identify
+ * sweep). Left out as not essential right now: DTC read/clear, VIN read,
+ * the plain address-discovery sweep, and VWTP -- all real JC-ESP32P4-M3
+ * features, just not ported here yet. */
+
+#define OBD_MODE_CURRENT_DATA 0x01
+#define OBD_REQUEST_ID 0x7DF
+#define OBD_RESPONSE_ID_MIN 0x7E8
+#define OBD_RESPONSE_ID_MAX 0x7EF
+#define OBD_REQUEST_ID_EXT 0x18DB33F1UL
+#define OBD_RESPONSE_ID_EXT_MIN 0x18DAF100UL
+#define OBD_RESPONSE_ID_EXT_MAX 0x18DAF1FFUL
+#define OBD_RESPONSE_TIMEOUT_MS 500
+#define OBD_QUERY_INTERVAL_MS 200
+#define OBD_ADDR_RESET_AFTER_TIMEOUTS 5
+
+/* Bench simulator's private identify ping -- see obd_identify_partner().
+ * A real car never answers this ID, so silence after a few attempts means
+ * "real car" (or "nothing on the bus yet"), not an error. */
+#define SIM_IDENTIFY_CAN_ID 0x702
+#define SIM_IDENTIFY_MAGIC 0xA5
+#define SIM_IDENTIFY_TIMEOUT_MS 250
+#define SIM_IDENTIFY_ATTEMPTS 3
+
+#define ISOTP_PCI_SF 0x0
+#define ISOTP_PCI_FF 0x1
+#define ISOTP_PCI_CF 0x2
+#define ISOTP_MAX_PAYLOAD 32
+
+#define DEEP_SCAN_ID_START 0xF180
+#define DEEP_SCAN_ID_END 0xF1A0
+#define DEEP_SCAN_MAX_HITS 8
+#define DEEP_SCAN_MAX_DIDS_PER_HIT 16
+#define DEEP_SCAN_NVS_NAMESPACE "deepscan"
+#define UDS_ADDR_SCAN_MAX_RANGE 256
+
+typedef struct {
+    uint32_t id;
+    uint8_t dlc;
+    uint8_t data[8];
+} obd_frame_t;
+
+typedef enum {
+    OBD_ADDR_UNKNOWN = 0,
+    OBD_ADDR_STANDARD,
+    OBD_ADDR_EXTENDED,
+} obd_addressing_t;
+static volatile obd_addressing_t s_obd_addressing = OBD_ADDR_UNKNOWN;
+static portMUX_TYPE s_obd_addressing_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef enum {
+    OBD_PARTNER_UNKNOWN = 0,
+    OBD_PARTNER_SIM_11,
+    OBD_PARTNER_SIM_29,
+    OBD_PARTNER_CAR_11,
+    OBD_PARTNER_CAR_29,
+} obd_partner_t;
+static volatile obd_partner_t s_obd_partner = OBD_PARTNER_UNKNOWN;
+static portMUX_TYPE s_obd_partner_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool s_identify_pending;
+static volatile uint8_t s_identify_response[2];
+static SemaphoreHandle_t s_identify_semaphore;
+
+/* True only for the brief window between sending a request and getting/
+ * timing out its reply -- see JC-ESP32P4-M3's s_obd_request_pending doc
+ * comment for why this matters (the simulator's own unsolicited broadcasts
+ * would otherwise desync the request/response pairing). */
+static volatile bool s_obd_request_pending;
+static QueueHandle_t s_obd_response_queue;
+
+static volatile bool s_uds_request_pending;
+static volatile uint32_t s_uds_expected_response_id;
+static QueueHandle_t s_uds_response_queue;
+
+static volatile bool s_can_passive;
+
+typedef enum {
+    UDS_SCAN_IDLE = 0,
+    UDS_SCAN_RUNNING,
+    UDS_SCAN_DONE,
+    UDS_SCAN_ERROR,
+} uds_scan_state_t;
+
+typedef enum {
+    UDS_SESSION_NOT_ATTEMPTED = 0,
+    UDS_SESSION_POSITIVE,
+    UDS_SESSION_NEGATIVE,
+    UDS_SESSION_TIMEOUT,
+} uds_session_state_t;
+
+typedef struct {
+    uint16_t did;
+    uint8_t dlc;
+    uint8_t data[8];
+} uds_scan_result_t;
+
+typedef struct {
+    uint32_t addr;
+    uds_session_state_t session_state;
+    uint8_t did_result_count;
+    uds_scan_result_t did_results[DEEP_SCAN_MAX_DIDS_PER_HIT];
+} deep_scan_hit_t;
+
+typedef struct {
+    uint32_t req_start;
+    uint32_t req_end;
+    uint32_t response_offset;
+    bool extended;
+    uds_scan_state_t state;
+    uint32_t current_req;
+    uint8_t hit_count;
+    deep_scan_hit_t hits[DEEP_SCAN_MAX_HITS];
+} deep_scan_t;
+
+static deep_scan_t s_deep_scan;
+static portMUX_TYPE s_deep_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_deep_scan_requested;
 
 static void decode_engine_broadcast(const uint8_t *data, uint8_t dlc)
 {
@@ -152,6 +282,65 @@ static void decode_vehicle_broadcast(const uint8_t *data, uint8_t dlc)
     portENTER_CRITICAL(&s_obd_lock);
     s_obd_state.speed_kmh = (uint8_t)(speed_centi_kmh / 100);
     portEXIT_CRITICAL(&s_obd_lock);
+}
+
+/* Decodes one active Mode 01 PID response (buf[0]=len, buf[1]=mode+0x40,
+ * buf[2]=pid, buf[3..]=data) into s_obd_state -- ported verbatim from
+ * JC-ESP32P4-M3's obd_print_response (SAE J1979 formulas per PID), minus
+ * the printf-style logging (ESP_LOGI is enough here). */
+static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
+{
+    switch (pid) {
+        case 0x00:
+            if (len >= 7) {
+                uint32_t bitmask = ((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16) |
+                                    ((uint32_t)buf[5] << 8) | buf[6];
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.supported_pids = bitmask;
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        case 0x05:
+            if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.coolant_c = buf[3] - 40;
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        case 0x0C:
+            if (len >= 5) {
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.rpm = ((unsigned)buf[3] * 256 + buf[4]) / 4;
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        case 0x0D:
+            if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.speed_kmh = buf[3];
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        case 0x11:
+            if (len >= 4) {
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.throttle_pct = (buf[3] * 100u) / 255u;
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        case 0x20:
+            if (len >= 7) {
+                uint32_t bitmask = ((uint32_t)buf[3] << 24) | ((uint32_t)buf[4] << 16) |
+                                    ((uint32_t)buf[5] << 8) | buf[6];
+                portENTER_CRITICAL(&s_obd_lock);
+                s_obd_state.supported_pids_2 = bitmask;
+                portEXIT_CRITICAL(&s_obd_lock);
+            }
+            break;
+        default:
+            ESP_LOGD(TAG, "OBD PID 0x%02x -> unrecognized response", pid);
+            break;
+    }
 }
 
 /* GET /api/can ring buffer + JSON contract, same idea -- see
@@ -205,11 +394,486 @@ static void capture_can_frame(const twai_message_t *message)
     frame->dlc = message->data_length_code > 8 ? 8 : message->data_length_code;
     memcpy(frame->data, message->data, frame->dlc);
     portEXIT_CRITICAL(&s_can_capture_lock);
+}
 
-    if (message->identifier == CAN_ID_ENGINE_STATE) {
-        decode_engine_broadcast(message->data, frame->dlc);
-    } else if (message->identifier == CAN_ID_VEHICLE_STATE) {
-        decode_vehicle_broadcast(message->data, frame->dlc);
+/* Transmits one frame -- the native TWAI driver takes standard and extended
+ * (29-bit) IDs through the same call (just the .extd flag), unlike
+ * JC-ESP32P4-M3's MCP2515 path (mcp2515_send), which needed separate
+ * register-level handling for each. Silently drops the send if the bus is
+ * in BUS_OFF or the queue is full rather than blocking the caller -- every
+ * caller here already has its own timeout waiting for a response, so a
+ * failed transmit just surfaces as that timeout instead of a distinct
+ * error path. */
+static void can_send(uint32_t id, bool extended, const uint8_t *data, uint8_t len)
+{
+    twai_message_t msg = {0};
+    msg.identifier = id;
+    msg.extd = extended;
+    msg.data_length_code = len > 8 ? 8 : len;
+    memcpy(msg.data, data, msg.data_length_code);
+    esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "can_send id=0x%lx failed: %s", (unsigned long)id, esp_err_to_name(err));
+    }
+}
+
+/* Reassembles one ISO-TP (ISO 15765-2) message starting from an already-
+ * dequeued frame that begins it -- ported verbatim from JC-ESP32P4-M3's
+ * isotp_reassemble (see that file for the full doc comment). Note: like
+ * the original, Consecutive Frames are pulled from s_obd_response_queue
+ * specifically, even when called from the UDS path (uds_send_and_receive
+ * below) -- harmless in practice since every UDS response seen so far
+ * (session control, DID reads) has fit in a Single Frame, but a genuinely
+ * multi-frame UDS response would need its own queue to reassemble
+ * correctly. Carried over as-is rather than "fixed" without being able to
+ * test a real multi-frame UDS response. */
+static bool isotp_reassemble(uint32_t response_id, const obd_frame_t *first,
+                              uint8_t *out_payload, uint8_t *out_len, int64_t deadline_us)
+{
+    if (first->dlc < 1) {
+        return false;
+    }
+    uint8_t pci = (first->data[0] >> 4) & 0x0F;
+
+    if (pci == ISOTP_PCI_SF) {
+        uint8_t sf_len = first->data[0] & 0x0F;
+        if (sf_len > 7) {
+            sf_len = 7;
+        }
+        if (sf_len > ISOTP_MAX_PAYLOAD) {
+            sf_len = ISOTP_MAX_PAYLOAD;
+        }
+        memcpy(out_payload, &first->data[1], sf_len);
+        *out_len = sf_len;
+        return true;
+    }
+
+    if (pci != ISOTP_PCI_FF) {
+        return false;
+    }
+
+    uint16_t total_len = ((uint16_t)(first->data[0] & 0x0F) << 8) | first->data[1];
+    if (total_len > ISOTP_MAX_PAYLOAD) {
+        total_len = ISOTP_MAX_PAYLOAD;
+    }
+    uint8_t received = (total_len < 6) ? total_len : 6;
+    memcpy(out_payload, &first->data[2], received);
+
+    bool response_is_extended = response_id > 0x7FF;
+    uint32_t request_id;
+    if (response_is_extended) {
+        uint8_t byte1 = (uint8_t)(response_id >> 8);
+        uint8_t byte0 = (uint8_t)response_id;
+        request_id = (response_id & 0xFFFF0000UL) | ((uint32_t)byte0 << 8) | byte1;
+    } else {
+        request_id = response_id - 8;
+    }
+    uint8_t fc[8] = { 0x30, 0x00, 0x00, 0, 0, 0, 0, 0 };
+    can_send(request_id, response_is_extended, fc, sizeof(fc));
+
+    uint8_t expected_seq = 1;
+    while (received < total_len) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        obd_frame_t frame;
+        if (!xQueueReceive(s_obd_response_queue, &frame, pdMS_TO_TICKS(remaining_ms))) {
+            break;
+        }
+        if (frame.id != response_id || frame.dlc < 1) {
+            continue;
+        }
+        uint8_t frame_pci = (frame.data[0] >> 4) & 0x0F;
+        if (frame_pci != ISOTP_PCI_CF || (frame.data[0] & 0x0F) != (expected_seq & 0x0F)) {
+            continue;
+        }
+        uint8_t chunk = total_len - received;
+        if (chunk > 7) {
+            chunk = 7;
+        }
+        memcpy(out_payload + received, &frame.data[1], chunk);
+        received += chunk;
+        expected_seq++;
+    }
+
+    *out_len = received;
+    return received > 0;
+}
+
+/* Sends one OBD request via both addressing schemes until one is locked in
+ * -- see JC-ESP32P4-M3's obd_send_request doc comment (same dual-scheme
+ * probe-then-commit behavior). */
+static void obd_send_request(const uint8_t *request, uint8_t len)
+{
+    portENTER_CRITICAL(&s_obd_addressing_lock);
+    obd_addressing_t addressing = s_obd_addressing;
+    portEXIT_CRITICAL(&s_obd_addressing_lock);
+
+    if (addressing != OBD_ADDR_EXTENDED) {
+        can_send(OBD_REQUEST_ID, false, request, len);
+    }
+    if (addressing != OBD_ADDR_STANDARD) {
+        can_send(OBD_REQUEST_ID_EXT, true, request, len);
+    }
+}
+
+/* Pings the bench simulator's private identify ID -- see JC-ESP32P4-M3's
+ * obd_identify_partner doc comment. A response means the simulator is on
+ * the bus and tells us its addressing mode directly; no response after
+ * SIM_IDENTIFY_ATTEMPTS means either a real vehicle (infer from whatever
+ * s_obd_addressing has locked onto from real OBD traffic) or nothing
+ * conclusive yet. */
+static void obd_identify_partner(void)
+{
+    if (s_can_passive) {
+        portENTER_CRITICAL(&s_obd_partner_lock);
+        s_obd_partner = OBD_PARTNER_UNKNOWN;
+        portEXIT_CRITICAL(&s_obd_partner_lock);
+        return;
+    }
+
+    uint8_t ping[1] = { 0x01 };
+    for (int attempt = 0; attempt < SIM_IDENTIFY_ATTEMPTS; attempt++) {
+        s_identify_response[0] = 0;
+        s_identify_response[1] = 0;
+        s_identify_pending = true;
+        can_send(SIM_IDENTIFY_CAN_ID, false, ping, sizeof(ping));
+        bool got = xSemaphoreTake(s_identify_semaphore, pdMS_TO_TICKS(SIM_IDENTIFY_TIMEOUT_MS)) == pdTRUE;
+        s_identify_pending = false;
+
+        if (got && s_identify_response[0] == SIM_IDENTIFY_MAGIC) {
+            bool ext = s_identify_response[1] != 0;
+            portENTER_CRITICAL(&s_obd_addressing_lock);
+            s_obd_addressing = ext ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
+            portEXIT_CRITICAL(&s_obd_addressing_lock);
+            portENTER_CRITICAL(&s_obd_partner_lock);
+            s_obd_partner = ext ? OBD_PARTNER_SIM_29 : OBD_PARTNER_SIM_11;
+            portEXIT_CRITICAL(&s_obd_partner_lock);
+            return;
+        }
+    }
+
+    portENTER_CRITICAL(&s_obd_addressing_lock);
+    obd_addressing_t addressing = s_obd_addressing;
+    portEXIT_CRITICAL(&s_obd_addressing_lock);
+    portENTER_CRITICAL(&s_obd_partner_lock);
+    if (addressing == OBD_ADDR_STANDARD) {
+        s_obd_partner = OBD_PARTNER_CAR_11;
+    } else if (addressing == OBD_ADDR_EXTENDED) {
+        s_obd_partner = OBD_PARTNER_CAR_29;
+    } else {
+        s_obd_partner = OBD_PARTNER_UNKNOWN;
+    }
+    portEXIT_CRITICAL(&s_obd_partner_lock);
+}
+
+static const char *obd_partner_to_string(obd_partner_t partner)
+{
+    switch (partner) {
+        case OBD_PARTNER_SIM_11: return "SIM_11";
+        case OBD_PARTNER_SIM_29: return "SIM_29";
+        case OBD_PARTNER_CAR_11: return "CAR_11";
+        case OBD_PARTNER_CAR_29: return "CAR_29";
+        default: return "UNKNOWN";
+    }
+}
+
+/* Point-to-point UDS send/wait -- exact request/response CAN ID pair
+ * supplied by the caller, unlike obd_send_request's dual-scheme functional
+ * broadcast. Shared by uds_read_did (service 0x22) and uds_start_session
+ * (service 0x10) below. */
+static bool uds_send_and_receive(uint32_t request_id, uint32_t response_id, bool extended,
+                                  const uint8_t *request, uint8_t request_len,
+                                  uint8_t *out_payload, uint8_t *out_len)
+{
+    s_uds_expected_response_id = response_id;
+    s_uds_request_pending = true;
+    can_send(request_id, extended, request, request_len);
+
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_RESPONSE_TIMEOUT_MS * 1000);
+    obd_frame_t response;
+    bool got = xQueueReceive(s_uds_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+    s_uds_request_pending = false;
+    if (!got) {
+        return false;
+    }
+    return isotp_reassemble(response.id, &response, out_payload, out_len, deadline_us);
+}
+
+static bool uds_read_did(uint32_t request_id, uint32_t response_id, bool extended,
+                          uint16_t did, uint8_t *out_payload, uint8_t *out_len)
+{
+    uint8_t request[8] = { 0x03, 0x22, (uint8_t)(did >> 8), (uint8_t)did, 0, 0, 0, 0 };
+    return uds_send_and_receive(request_id, response_id, extended, request, sizeof(request),
+                                 out_payload, out_len);
+}
+
+static uds_session_state_t uds_start_session(uint32_t request_id, uint32_t response_id, bool extended)
+{
+    uint8_t request[8] = { 0x02, 0x10, 0x03, 0, 0, 0, 0, 0 };
+    uint8_t payload[ISOTP_MAX_PAYLOAD];
+    uint8_t payload_len = 0;
+    bool got = uds_send_and_receive(request_id, response_id, extended, request, sizeof(request),
+                                     payload, &payload_len);
+    if (!got) {
+        return UDS_SESSION_TIMEOUT;
+    }
+    if (payload_len >= 2 && payload[0] == 0x50 && payload[1] == 0x03) {
+        return UDS_SESSION_POSITIVE;
+    }
+    return UDS_SESSION_NEGATIVE;
+}
+
+/* --- Deep Scan NVS persistence -- ported verbatim from JC-ESP32P4-M3 (see
+ * deep_scan_t's doc comment there for why: surviving brownout resets during
+ * an unattended sweep by persisting progress and resuming automatically at
+ * boot instead of losing a long run to one crash partway through). */
+static void deep_scan_nvs_save_progress(uint32_t current_req)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u32(handle, "cur_req", current_req);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_nvs_save_hits(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    uint8_t hit_count = s_deep_scan.hit_count;
+    deep_scan_hit_t hits_copy[DEEP_SCAN_MAX_HITS];
+    memcpy(hits_copy, s_deep_scan.hits, sizeof(hits_copy));
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    nvs_set_u8(handle, "hit_count", hit_count);
+    nvs_set_blob(handle, "hits", hits_copy, sizeof(hits_copy));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_nvs_set_active(bool active)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(handle, "active", active ? 1 : 0);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_nvs_save_params(uint32_t req_start, uint32_t req_end, uint32_t response_offset, bool extended)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_u32(handle, "req_start", req_start);
+    nvs_set_u32(handle, "req_end", req_end);
+    nvs_set_u32(handle, "resp_off", response_offset);
+    nvs_set_u8(handle, "extended", extended ? 1 : 0);
+    nvs_set_u32(handle, "cur_req", req_start);
+    nvs_set_u8(handle, "hit_count", 0);
+    deep_scan_hit_t empty_hits[DEEP_SCAN_MAX_HITS] = {0};
+    nvs_set_blob(handle, "hits", empty_hits, sizeof(empty_hits));
+    nvs_set_u8(handle, "active", 1);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void deep_scan_resume_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEEP_SCAN_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    uint8_t active = 0;
+    if (nvs_get_u8(handle, "active", &active) != ESP_OK || !active) {
+        nvs_close(handle);
+        return;
+    }
+    uint32_t req_start = 0, req_end = 0, response_offset = 0, current_req = 0;
+    uint8_t extended = 0, hit_count = 0;
+    nvs_get_u32(handle, "req_start", &req_start);
+    nvs_get_u32(handle, "req_end", &req_end);
+    nvs_get_u32(handle, "resp_off", &response_offset);
+    nvs_get_u8(handle, "extended", &extended);
+    nvs_get_u32(handle, "cur_req", &current_req);
+    nvs_get_u8(handle, "hit_count", &hit_count);
+    deep_scan_hit_t hits[DEEP_SCAN_MAX_HITS] = {0};
+    size_t hits_size = sizeof(hits);
+    nvs_get_blob(handle, "hits", hits, &hits_size);
+    nvs_close(handle);
+
+    if (req_end < req_start || current_req > req_end) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.req_start = req_start;
+    s_deep_scan.req_end = req_end;
+    s_deep_scan.response_offset = response_offset;
+    s_deep_scan.extended = extended != 0;
+    s_deep_scan.current_req = current_req;
+    s_deep_scan.hit_count = hit_count > DEEP_SCAN_MAX_HITS ? DEEP_SCAN_MAX_HITS : hit_count;
+    memcpy(s_deep_scan.hits, hits, sizeof(hits));
+    s_deep_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan_requested = true;
+    ESP_LOGI(TAG, "Deep scan: resuming after reset at 0x%lx (range 0x%lx-0x%lx, %u hit(s) so far)",
+             (unsigned long)current_req, (unsigned long)req_start, (unsigned long)req_end, (unsigned)hit_count);
+}
+
+/* Services a deep-scan request: sweeps request IDs, and for every address
+ * that gets a real response (not a timeout), immediately runs the
+ * identification-DID sweep against it before moving to the next candidate
+ * -- see JC-ESP32P4-M3's obd_query_deep_scan_if_requested doc comment. */
+static void obd_query_deep_scan_if_requested(void)
+{
+    if (!s_deep_scan_requested) {
+        return;
+    }
+    s_deep_scan_requested = false;
+
+    uint32_t req_start, req_end, response_offset, resume_req;
+    bool extended;
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    req_start = s_deep_scan.req_start;
+    req_end = s_deep_scan.req_end;
+    response_offset = s_deep_scan.response_offset;
+    extended = s_deep_scan.extended;
+    resume_req = s_deep_scan.current_req;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+
+    if (s_can_passive) {
+        ESP_LOGW(TAG, "Deep scan requested while CAN bridge is passive; ignored");
+        portENTER_CRITICAL(&s_deep_scan_lock);
+        s_deep_scan.state = UDS_SCAN_ERROR;
+        portEXIT_CRITICAL(&s_deep_scan_lock);
+        deep_scan_nvs_set_active(false);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deep scan starting at 0x%lx (range 0x%lx-0x%lx)",
+             (unsigned long)resume_req, (unsigned long)req_start, (unsigned long)req_end);
+
+    for (uint32_t req_id = resume_req; req_id <= req_end; req_id++) {
+        portENTER_CRITICAL(&s_deep_scan_lock);
+        s_deep_scan.current_req = req_id;
+        portEXIT_CRITICAL(&s_deep_scan_lock);
+        deep_scan_nvs_save_progress(req_id);
+
+        uint32_t resp_id = req_id + response_offset;
+        uds_session_state_t session_state = uds_start_session(req_id, resp_id, extended);
+
+        if (session_state != UDS_SESSION_TIMEOUT) {
+            ESP_LOGI(TAG, "Deep scan: 0x%lx -> %s, identifying...", (unsigned long)req_id,
+                     session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+
+            deep_scan_hit_t hit;
+            memset(&hit, 0, sizeof(hit));
+            hit.addr = req_id;
+            hit.session_state = session_state;
+            for (uint32_t did = DEEP_SCAN_ID_START; did <= DEEP_SCAN_ID_END; did++) {
+                uint8_t payload[ISOTP_MAX_PAYLOAD];
+                uint8_t payload_len = 0;
+                bool ok = uds_read_did(req_id, resp_id, extended, (uint16_t)did, payload, &payload_len);
+                if (ok && payload_len >= 3 && payload[0] == 0x62 &&
+                    (uint16_t)(((uint16_t)payload[1] << 8) | payload[2]) == (uint16_t)did &&
+                    hit.did_result_count < DEEP_SCAN_MAX_DIDS_PER_HIT) {
+                    uds_scan_result_t *result = &hit.did_results[hit.did_result_count++];
+                    result->did = (uint16_t)did;
+                    result->dlc = payload_len > 8 ? 8 : payload_len;
+                    memcpy(result->data, payload, result->dlc);
+                }
+                vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+            }
+
+            portENTER_CRITICAL(&s_deep_scan_lock);
+            if (s_deep_scan.hit_count < DEEP_SCAN_MAX_HITS) {
+                s_deep_scan.hits[s_deep_scan.hit_count++] = hit;
+            }
+            portEXIT_CRITICAL(&s_deep_scan_lock);
+            deep_scan_nvs_save_hits();
+            ESP_LOGI(TAG, "Deep scan: 0x%lx identified, %u DID(s) responded",
+                     (unsigned long)req_id, (unsigned)hit.did_result_count);
+        } else {
+            ESP_LOGD(TAG, "Deep scan: 0x%lx -> timeout", (unsigned long)req_id);
+            vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+        }
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.state = UDS_SCAN_DONE;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    deep_scan_nvs_set_active(false);
+    ESP_LOGI(TAG, "Deep scan complete: %u module(s) identified", (unsigned)s_deep_scan.hit_count);
+}
+
+/* Routes one received frame to whichever consumer (if any) is waiting for
+ * it -- identify-ping reply, UDS point-to-point response, OBD Mode 01
+ * response (locks in the addressing scheme on the first real reply, like a
+ * real scan tool committing after its initial probe), or the simulator's
+ * unsolicited engine/vehicle broadcasts. Called from can_receive_task right
+ * after capture_can_frame(); capture always happens regardless of routing. */
+static void route_can_frame(const twai_message_t *message)
+{
+    uint32_t id = message->identifier;
+    uint8_t dlc = message->data_length_code > 8 ? 8 : message->data_length_code;
+    const uint8_t *data = message->data;
+
+    if (s_uds_request_pending && id == s_uds_expected_response_id) {
+        obd_frame_t frame = { .id = id, .dlc = dlc };
+        memcpy(frame.data, data, sizeof(frame.data));
+        if (xQueueSend(s_uds_response_queue, &frame, 0) != pdPASS) {
+            ESP_LOGW(TAG, "UDS response queue full; dropping response");
+        }
+        return;
+    }
+    if (id == SIM_IDENTIFY_CAN_ID) {
+        if (s_identify_pending && dlc >= 2) {
+            s_identify_response[0] = data[0];
+            s_identify_response[1] = data[1];
+            xSemaphoreGive(s_identify_semaphore);
+        }
+        return;
+    }
+    bool response_is_extended = (id >= OBD_RESPONSE_ID_EXT_MIN && id <= OBD_RESPONSE_ID_EXT_MAX);
+    bool is_obd_response = (id >= OBD_RESPONSE_ID_MIN && id <= OBD_RESPONSE_ID_MAX) || response_is_extended;
+    if (is_obd_response) {
+        portENTER_CRITICAL(&s_obd_addressing_lock);
+        if (s_obd_addressing == OBD_ADDR_UNKNOWN) {
+            s_obd_addressing = response_is_extended ? OBD_ADDR_EXTENDED : OBD_ADDR_STANDARD;
+        }
+        portEXIT_CRITICAL(&s_obd_addressing_lock);
+        if (s_can_passive) {
+            if (dlc >= 3 && data[1] == (uint8_t)(0x40 | OBD_MODE_CURRENT_DATA)) {
+                obd_print_response(data[2], data, dlc);
+            }
+        } else if (s_obd_request_pending) {
+            obd_frame_t frame = { .id = id, .dlc = dlc };
+            memcpy(frame.data, data, sizeof(frame.data));
+            if (xQueueSend(s_obd_response_queue, &frame, 0) != pdPASS) {
+                ESP_LOGW(TAG, "OBD response queue full; dropping response");
+            }
+        } else if (dlc >= 3 && data[1] == (uint8_t)(0x40 | OBD_MODE_CURRENT_DATA)) {
+            obd_print_response(data[2], data, dlc);
+        }
+        return;
+    }
+    if (id == CAN_ID_ENGINE_STATE) {
+        decode_engine_broadcast(data, dlc);
+        return;
+    }
+    if (id == CAN_ID_VEHICLE_STATE) {
+        decode_vehicle_broadcast(data, dlc);
+        return;
     }
 }
 
@@ -361,10 +1025,155 @@ static esp_err_t can_capture_http_handler(httpd_req_t *request)
     return result;
 }
 
+/* Re-probes (obd_identify_partner) on every request rather than just
+ * reporting a cached value, so a fresh probe happens whenever the app
+ * checks this -- matches JC-ESP32P4-M3's can_partner_http_handler. */
+static esp_err_t can_partner_http_handler(httpd_req_t *request)
+{
+    obd_identify_partner();
+    portENTER_CRITICAL(&s_obd_partner_lock);
+    obd_partner_t partner = s_obd_partner;
+    portEXIT_CRITICAL(&s_obd_partner_lock);
+
+    char response[48];
+    snprintf(response, sizeof(response), "{\"partner\":\"%s\"}", obd_partner_to_string(partner));
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
+/* Body: "active" or "passive". Reconfigures the TWAI controller's actual
+ * hardware mode -- see can_set_mode's doc comment. */
+static esp_err_t can_mode_http_handler(httpd_req_t *request)
+{
+    char mode[8] = {0};
+    int received = httpd_req_recv(request, mode, sizeof(mode) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected active or passive");
+        return ESP_FAIL;
+    }
+    mode[received] = '\0';
+
+    bool passive;
+    if (strcmp(mode, "passive") == 0) {
+        passive = true;
+    } else if (strcmp(mode, "active") == 0) {
+        passive = false;
+    } else {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected active or passive");
+        return ESP_FAIL;
+    }
+
+    can_set_mode(passive);
+    httpd_resp_set_type(request, "text/plain");
+    httpd_resp_sendstr(request, passive ? "OK passive" : "OK active");
+    return ESP_OK;
+}
+
+/* Body (plain text): "req_start,req_end,offset,extended" (hex,hex,hex,0|1),
+ * e.g. "710,710,6A,0" -- see JC-ESP32P4-M3's deep_scan_start_http_handler
+ * doc comment (same contract, including the max-256-address range limit).
+ * Always starts a *fresh* scan from req_start. */
+static esp_err_t deep_scan_start_http_handler(httpd_req_t *request)
+{
+    char body[48] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected req_start,req_end,offset,extended");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    unsigned long req_start = 0, req_end = 0, offset = 0, extended = 0;
+    if (sscanf(body, "%lx,%lx,%lx,%lu", &req_start, &req_end, &offset, &extended) != 4) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                             "Expected req_start,req_end,offset,extended (hex,hex,hex,0|1)");
+        return ESP_FAIL;
+    }
+    if (req_end < req_start || (req_end - req_start + 1) > UDS_ADDR_SCAN_MAX_RANGE) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Address range invalid or too large (max 256)");
+        return ESP_FAIL;
+    }
+
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    s_deep_scan.req_start = (uint32_t)req_start;
+    s_deep_scan.req_end = (uint32_t)req_end;
+    s_deep_scan.response_offset = (uint32_t)offset;
+    s_deep_scan.extended = extended != 0;
+    s_deep_scan.current_req = (uint32_t)req_start;
+    s_deep_scan.hit_count = 0;
+    memset(s_deep_scan.hits, 0, sizeof(s_deep_scan.hits));
+    s_deep_scan.state = UDS_SCAN_RUNNING;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+    deep_scan_nvs_save_params((uint32_t)req_start, (uint32_t)req_end, (uint32_t)offset, extended != 0);
+    s_deep_scan_requested = true;
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"deep scan requested\"}");
+    return ESP_OK;
+}
+
+/* Same JSON contract as JC-ESP32P4-M3's deep_scan_status_http_handler. */
+static esp_err_t deep_scan_status_http_handler(httpd_req_t *request)
+{
+    deep_scan_t snapshot;
+    portENTER_CRITICAL(&s_deep_scan_lock);
+    snapshot = s_deep_scan;
+    portEXIT_CRITICAL(&s_deep_scan_lock);
+
+    const char *state_str;
+    switch (snapshot.state) {
+        case UDS_SCAN_RUNNING: state_str = "running"; break;
+        case UDS_SCAN_DONE: state_str = "done"; break;
+        case UDS_SCAN_ERROR: state_str = "error"; break;
+        default: state_str = "idle"; break;
+    }
+
+    static char response[DEEP_SCAN_MAX_HITS * (DEEP_SCAN_MAX_DIDS_PER_HIT * 48 + 96) + 128];
+    int written = snprintf(response, sizeof(response),
+            "{\"state\":\"%s\",\"current_req\":\"0x%03lx\",\"hit_count\":%u,\"hits\":[",
+            state_str, (unsigned long)snapshot.current_req, snapshot.hit_count);
+    size_t used = (written > 0 && (size_t)written < sizeof(response)) ? (size_t)written : sizeof(response);
+    for (uint8_t i = 0; i < snapshot.hit_count && i < DEEP_SCAN_MAX_HITS && used < sizeof(response); i++) {
+        deep_scan_hit_t *hit = &snapshot.hits[i];
+        written = snprintf(response + used, sizeof(response) - used,
+                "%s{\"addr\":\"0x%03lx\",\"session\":\"%s\",\"did_results\":[",
+                i == 0 ? "" : ",", (unsigned long)hit->addr,
+                hit->session_state == UDS_SESSION_POSITIVE ? "positive" : "negative");
+        used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+
+        for (uint8_t d = 0; d < hit->did_result_count && d < DEEP_SCAN_MAX_DIDS_PER_HIT && used < sizeof(response); d++) {
+            char hex[17] = {0};
+            uint8_t hex_bytes = hit->did_results[d].dlc > 8 ? 8 : hit->did_results[d].dlc;
+            for (uint8_t b = 0; b < hex_bytes; b++) {
+                snprintf(hex + b * 2, 3, "%02X", hit->did_results[d].data[b]);
+            }
+            written = snprintf(response + used, sizeof(response) - used,
+                    "%s{\"did\":\"0x%04x\",\"data\":\"%s\"}",
+                    d == 0 ? "" : ",", hit->did_results[d].did, hex);
+            used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+        }
+        if (used < sizeof(response)) {
+            written = snprintf(response + used, sizeof(response) - used, "]}");
+            used += (written > 0 && (size_t)written < sizeof(response) - used) ? (size_t)written : sizeof(response) - used;
+        }
+    }
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used, "]}");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, response);
+    return ESP_OK;
+}
+
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
+    /* Stock default is exactly 8 -- we now register exactly 8 handlers,
+     * right at the edge. Give headroom for whatever's added next. */
+    config.max_uri_handlers = 16;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server start failed");
@@ -390,11 +1199,36 @@ static void start_http_server(void)
         .method = HTTP_GET,
         .handler = obd_http_handler,
     };
+    httpd_uri_t can_partner_uri = {
+        .uri = "/api/can/partner",
+        .method = HTTP_GET,
+        .handler = can_partner_http_handler,
+    };
+    httpd_uri_t can_mode_uri = {
+        .uri = "/api/can/mode",
+        .method = HTTP_POST,
+        .handler = can_mode_http_handler,
+    };
+    httpd_uri_t deep_scan_start_uri = {
+        .uri = "/api/deepscan",
+        .method = HTTP_POST,
+        .handler = deep_scan_start_http_handler,
+    };
+    httpd_uri_t deep_scan_status_uri = {
+        .uri = "/api/deepscan",
+        .method = HTTP_GET,
+        .handler = deep_scan_status_http_handler,
+    };
     httpd_register_uri_handler(server, &frequency_uri);
     httpd_register_uri_handler(server, &gps_uri);
     httpd_register_uri_handler(server, &can_uri);
     httpd_register_uri_handler(server, &obd_uri);
-    ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>, GET /api/obd");
+    httpd_register_uri_handler(server, &can_partner_uri);
+    httpd_register_uri_handler(server, &can_mode_uri);
+    httpd_register_uri_handler(server, &deep_scan_start_uri);
+    httpd_register_uri_handler(server, &deep_scan_status_uri);
+    ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>, GET /api/obd, "
+             "GET /api/can/partner, POST /api/can/mode, GET|POST /api/deepscan");
 }
 
 /* BLE+WiFi concurrency was tested exhaustively and abandoned -- see
@@ -542,6 +1376,7 @@ static void can_receive_task(void *arg)
         esp_err_t err = twai_receive(&message, pdMS_TO_TICKS(1000));
         if (err == ESP_OK) {
             capture_can_frame(&message);
+            route_can_frame(&message);
         } else if (err == ESP_ERR_TIMEOUT) {
             twai_status_info_t diag = {0};
             twai_get_status_info(&diag);
@@ -745,11 +1580,50 @@ static void start_gps(void)
     xTaskCreatePinnedToCore(gps_receive_task, "gps_rx", 4096, NULL, 5, NULL, 1);
 }
 
+/* Reconfigures the TWAI controller's actual hardware mode -- true listen-
+ * only (not just a software gate on our own transmit calls), so on a real
+ * car "Passive" genuinely can't ACK or disturb bus traffic at the
+ * controller level. Requires a full stop/uninstall/reinstall since
+ * ESP-IDF's TWAI driver has no live mode-change call -- ported behavior
+ * from JC-ESP32P4-M3's can_mode_http_handler (mcp2515_set_listen_only
+ * there does the equivalent for that board's controller). */
+static void can_set_mode(bool passive)
+{
+    twai_stop();
+    twai_driver_uninstall();
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+            CAN_TX_GPIO, CAN_RX_GPIO, passive ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL);
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "can_set_mode: twai_driver_install failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = twai_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "can_set_mode: twai_start failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_can_passive = passive;
+    if (!passive) {
+        xQueueReset(s_obd_response_queue);
+    }
+    ESP_LOGI(TAG, "CAN mode changed to %s", passive ? "passive" : "active");
+}
+
 static void start_can(void)
 {
     s_can_capture = heap_caps_calloc(CAN_CAPTURE_CAPACITY, sizeof(can_capture_frame_t), MALLOC_CAP_SPIRAM);
     if (s_can_capture == NULL) {
         ESP_LOGE(TAG, "CAN: failed to allocate %d-frame capture buffer in PSRAM", CAN_CAPTURE_CAPACITY);
+        return;
+    }
+    s_obd_response_queue = xQueueCreate(16, sizeof(obd_frame_t));
+    s_uds_response_queue = xQueueCreate(4, sizeof(obd_frame_t));
+    s_identify_semaphore = xSemaphoreCreateBinary();
+    if (s_obd_response_queue == NULL || s_uds_response_queue == NULL || s_identify_semaphore == NULL) {
+        ESP_LOGE(TAG, "CAN: failed to allocate OBD/UDS queues or semaphore");
         return;
     }
 
@@ -785,6 +1659,81 @@ static void start_can(void)
                  "Free heap=%lu internal=%lu", (int)created,
                  (unsigned long)esp_get_free_heap_size(),
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+    xTaskCreatePinnedToCore(obd_query_task, "obd_query", 4096, NULL, 5, NULL, 1);
+    /* Picks back up an interrupted deep scan (most likely a brownout reset
+     * mid-sweep) -- see deep_scan_resume_from_nvs's doc comment. Safe to
+     * call even if none was ever started. */
+    deep_scan_resume_from_nvs();
+}
+
+/* Active Mode 01 PID polling -- ported from JC-ESP32P4-M3's obd_query_task,
+ * trimmed to just what's essential here: the deep-scan trigger and the PID
+ * loop with its multi-ECU responder-lock disambiguation (a real car,
+ * unlike the simulator's single ECU, can have more than one module answer
+ * a functional broadcast -- see the doc comment below for why that
+ * matters). DTC/VIN/address-scan/VWTP triggers from the original aren't
+ * ported (not needed for this board yet). Passive mode still gets live
+ * data for free via route_can_frame's unsolicited-broadcast decode path
+ * (decode_engine_broadcast/decode_vehicle_broadcast, or obd_print_response
+ * on the simulator's own unsolicited PID broadcasts) -- this task simply
+ * skips actually transmitting while passive. */
+static void obd_query_task(void *arg)
+{
+    (void)arg;
+    static const uint8_t pids[] = { 0x00, 0x05, 0x0C, 0x0D, 0x11, 0x20 };
+    uint8_t consecutive_timeouts = 0;
+    /* Which physical ECU's responses to trust, once one has answered -- see
+     * JC-ESP32P4-M3's obd_query_task doc comment: a real car can have more
+     * than one module willing to answer a functional-broadcast Mode 01
+     * request, and only the first one to answer should keep being trusted
+     * for the rest of this PID sequence. 0 means "not locked yet". */
+    uint32_t responder_id = 0;
+
+    while (1) {
+        obd_query_deep_scan_if_requested();
+
+        for (size_t i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
+            if (s_can_passive) {
+                vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+                continue;
+            }
+
+            uint8_t request[8] = { 0x02, OBD_MODE_CURRENT_DATA, pids[i], 0, 0, 0, 0, 0 };
+            s_obd_request_pending = true;
+            obd_send_request(request, sizeof(request));
+
+            obd_frame_t response;
+            bool got = xQueueReceive(s_obd_response_queue, &response, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS));
+            s_obd_request_pending = false;
+            bool id_ok = (responder_id == 0) || (response.id == responder_id);
+            if (got && response.dlc >= 3 && response.data[2] == pids[i] && id_ok) {
+                if (responder_id == 0) {
+                    responder_id = response.id;
+                    ESP_LOGI(TAG, "OBD responder locked to id 0x%lx", (unsigned long)responder_id);
+                }
+                obd_print_response(pids[i], response.data, response.dlc);
+                consecutive_timeouts = 0;
+            } else if (got && response.dlc >= 3 && response.data[2] == pids[i]) {
+                ESP_LOGW(TAG, "OBD PID 0x%02x -> answered by id 0x%lx, not the locked responder 0x%lx; discarding",
+                         pids[i], (unsigned long)response.id, (unsigned long)responder_id);
+                consecutive_timeouts = 0;
+            } else if (got) {
+                ESP_LOGW(TAG, "OBD PID 0x%02x -> mismatched response (got pid 0x%02x), discarding",
+                         pids[i], response.data[2]);
+                consecutive_timeouts = 0;
+            } else {
+                if (++consecutive_timeouts >= OBD_ADDR_RESET_AFTER_TIMEOUTS) {
+                    consecutive_timeouts = 0;
+                    responder_id = 0;
+                    portENTER_CRITICAL(&s_obd_addressing_lock);
+                    s_obd_addressing = OBD_ADDR_UNKNOWN;
+                    portEXIT_CRITICAL(&s_obd_addressing_lock);
+                }
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_INTERVAL_MS));
+        }
     }
 }
 
