@@ -29,6 +29,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
@@ -650,7 +651,7 @@ static void start_gps(void)
     ESP_ERROR_CHECK(uart_set_pin(GPS_UART_PORT, GPS_TX_GPIO, GPS_RX_GPIO,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "GPS UART ready: TX=GPIO%d RX=GPIO%d %d baud", GPS_TX_GPIO, GPS_RX_GPIO, GPS_BAUD);
-    xTaskCreate(gps_receive_task, "gps_rx", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(gps_receive_task, "gps_rx", 4096, NULL, 5, NULL, 1);
 }
 
 static void start_can(void)
@@ -681,13 +682,36 @@ static void start_can(void)
      * a genuinely running receive task logs *something* every second
      * regardless of what's on the wire. Checking the return value and
      * free heap here to catch that precisely instead of guessing. */
-    BaseType_t created = xTaskCreate(can_receive_task, "can_rx", 4096, NULL, 5, NULL);
+    BaseType_t created = xTaskCreatePinnedToCore(can_receive_task, "can_rx", 4096, NULL, 5, NULL, 1);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "CAN: xTaskCreate FAILED (result=%d) -- can_receive_task never started. "
                  "Free heap=%lu internal=%lu", (int)created,
                  (unsigned long)esp_get_free_heap_size(),
                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     }
+}
+
+/* GPS temporarily disabled -- confirmed CAN+GPS together (not either
+ * alone) break Wi-Fi/BLE reliability, root cause not yet found (moving
+ * both to CPU1 didn't fix it either). Keeping the known-good CAN-only
+ * config live so the app's own Monitor tab can be verified end-to-end
+ * over real Wi-Fi while that's investigated further. Re-enable
+ * start_gps() once the actual conflict is found and fixed. */
+static void sensors_init_task(void *arg)
+{
+    SemaphoreHandle_t done = (SemaphoreHandle_t)arg;
+    start_can();
+    // start_gps();
+    xSemaphoreGive(done);
+    vTaskDelete(NULL);
+}
+
+static void sensors_init_on_core1(void)
+{
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(sensors_init_task, "sensors_init", 4096, done, 5, NULL, 1);
+    xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
 }
 
 void app_main(void)
@@ -727,16 +751,18 @@ void app_main(void)
         ESP_LOGI(TAG, "led_strip init OK on GPIO%d", LED_GPIO_CANDIDATE);
     }
 
-    /* CAN+GPS together (not either alone, not BLE/WiFi coexistence --
-     * see HARDWARE_MIGRATION.md's corrected DHCP resolution) intermittently
-     * break Wi-Fi/BLE join reliability, root cause not yet pinned down
-     * further (likely a shared interrupt/timer/DMA resource conflict
-     * between the TWAI and UART drivers). Left both enabled here to match
-     * the real feature set; BoardLink.connectToBoardNetwork's automatic
-     * retry (added the same day) papers over the occasional lost join
-     * until the actual resource conflict is found and fixed. */
-    start_can();
-    start_gps();
+    /* CAN+GPS together (not either alone) intermittently break Wi-Fi/BLE
+     * join reliability -- see HARDWARE_MIGRATION.md's corrected DHCP
+     * resolution. Leading theory being tested here: WiFi and BLE are both
+     * pinned to CPU0 (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0,
+     * CONFIG_BT_NIMBLE_PINNED_TO_CORE_0), and app_main() itself runs
+     * pinned to CPU0 too (CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0) -- so
+     * calling start_can()/start_gps() directly here puts the TWAI and
+     * UART drivers' esp_intr_alloc()'d ISRs on the SAME core as WiFi/BLE's
+     * own timing-critical interrupts. Running their init from a task
+     * pinned to CPU1 instead should move those ISRs off CPU0 entirely,
+     * leaving it free for WiFi/BLE. */
+    sensors_init_on_core1();
     start_wifi_ap();
     start_ble();
 
