@@ -565,3 +565,53 @@ model/year is still the most likely explanation, then a transport-format
 mismatch); it just rules out "we're on the wrong physical bus and need
 new hardware" as the fix. Corrected before it became the basis for
 buying/wiring anything.
+
+## Deep dive: the J533 Gateway module, 2026-09-20
+
+Requested follow-up: research the actual Gateway module itself, not just
+its behavior over UDS. Real, useful findings:
+
+**The Gateway is a real, physically locatable module: J533, in the
+driver's footwell.** Per the [openpilot Volkswagen
+wiki](https://github.com/commaai/openpilot/wiki/Volkswagen): "Most VAG
+cars use the J533 Harness which connects at the gateway in the drivers
+footwell." Its documented job (per the same source, echoing our own
+`0x710` findings) is "the exchange of data between the CAN databus
+systems ('powertrain CAN databus,' 'convenience CAN databus' and
+'infotainment CAN databus') and the conversion of diagnostic data from
+CAN databus systems" -- i.e. bridging exactly the three buses relevant
+here, powertrain (where our OBD data comes from), convenience/comfort
+(where lock/door/light modules almost certainly live), and infotainment.
+
+**How a mature real-world project actually reaches the Comfort bus**:
+openpilot (steering/ACC control, needs the Comfort/"extended" CAN bus for
+LKAS-relevant signals) does **not** get there through clever OBD-II UDS
+routing. It physically splices into the **J533's own connector**,
+in-line, using a purpose-built harness (red plug = outbound/CAN0, black
+socket = inbound/CAN2 in their terminology) -- see
+[hardybm/comma-J533-harness](https://github.com/hardybm/comma-J533-harness)
+for a real DIY build (wiring diagram images in that repo, not yet
+reviewed here -- worth a visual check against our own Gateway's actual
+connector when next at the car). This is a real, working, physical
+second-tap approach -- but at a **known, specific, physically locatable
+point** (the Gateway's own connector) rather than blind wire-hunting
+behind a door panel as originally framed.
+
+**A real caveat that turned out not to apply to us**: the same wiki notes
+"a few MQB-A0 cars ... don't have a gateway and have to use the camera
+harness" instead (OBD2-port-based, no J533 to splice into, no
+experimental longitudinal control support in openpilot's case). This
+doesn't apply here -- **we've already directly proven this Fabia has a
+real Gateway module** (`0x710` responds to UDS and self-identifies as
+"GW"/supplier "Har"/part "3Q0"), so the standard J533-splice path is the
+relevant one, not the camera-harness exception.
+
+**Where this leaves things**: a second physical tap at the J533's own
+connector is a real, precedented, working method other serious projects
+use for exactly this kind of access -- meaningfully more concrete than
+"tap the Comfort bus somewhere in the car" was before. Still requires:
+locating the Gateway physically (driver's footwell, per this source --
+worth confirming against the actual car), and ideally comparing its real
+connector against the wiring diagrams in the linked harness repos before
+attempting a splice, since none of this has been visually verified
+against a 2026 Fabia specifically yet.
