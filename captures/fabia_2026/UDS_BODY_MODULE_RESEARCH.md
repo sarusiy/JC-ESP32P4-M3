@@ -463,6 +463,18 @@ neither yet attempted:
    -- this Fabia (VIN-decoded as Typ PJ / MQB-A0, see project memory) isn't
    expected to have it based on every public MQB-A0-vs-MQB-Evo/MEB
    reference found so far, but that's inference, not a direct check.
+   **Updated 2026-09-20**: this lead got more credible, not less -- real
+   commercial "ENET" DoIP cables are sold specifically for "MQB" vehicles
+   (some listings bundle MQB/EVO/MEB/MLB together, imprecise about which
+   MQB sub-generation), using pins 1 (activation, +5V once detected) and 8
+   (activation-detect, tested via resistance to pin 5/ground) for
+   100BASE-T1 Ethernet -- a completely different, richer channel than
+   classic CAN diagnostics, used by ODIS for full module programming.
+   Still unconfirmed whether *this specific* Typ PJ has it wired, but a
+   2-minute multimeter check on pins 1/8 would settle it directly instead
+   of relying on inference. If present, this is a real alternative path
+   that needs no new CAN hardware -- just a standard USB-to-Ethernet
+   adapter on those two pins.
 2. Accept that body/comfort modules may simply not be reachable from the
    OBD-II connector on this platform via any addressing scheme, and that
    this project's anti-theft goals may be better served by the physical
