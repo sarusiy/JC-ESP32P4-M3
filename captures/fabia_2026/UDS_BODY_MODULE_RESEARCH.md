@@ -468,3 +468,88 @@ neither yet attempted:
    this project's anti-theft goals may be better served by the physical
    immobilizer approach already scoped separately (starter-circuit relay)
    rather than continuing to chase CAN-based body-module access.
+
+**UPDATE 2026-09-20 -- a third, independent check adds to the negative
+result: passive presence, not just active addressing.** Built
+`tools/can_id_triage.py` plus a persistent `signal_dictionary.json` (see
+that file for the full known-ID list) to check something neither UDS
+sweep tests: whether these modules broadcast *anything unprompted*, since
+direct addressing being blocked doesn't necessarily mean a module never
+transmits at all. Ran the fixed-ID presence check against **every real
+CAN capture ever taken on this car** -- all 5 sessions
+(2026-09-13 through 2026-09-15), 209,958 frames, ~35 minutes of combined
+recording time across baseline/lock/unlock/door/headlight/high-beam/
+ignition/normal-drive actions and the two dedicated address-discovery
+sessions. **None of the 8 candidate body-module request or response IDs
+(`0x70D`/`0x777`, `0x71E`/`0x788`, `0x74A`/`0x7B4`, `0x74B`/`0x7B5`,
+`0x73E`/`0x7A8`, `0x73F`/`0x7A9`, `0x754`/`0x7BE`, `0x730`/`0x79A`)
+appear even once as a sender, in either direction, anywhere in that
+entire dataset.** Only two unrelated genuine unknowns exist on this bus
+at all (`0x17F00010`, `0x1BFC8202` -- both already known/undecoded
+background broadcasts, see the signal dictionary), plus the Gateway's own
+`0x77A` response id (added to the dictionary this session, previously
+only `0x710` itself was tracked).
+
+This strengthens direction 2 above from "two addressing schemes found
+nothing" to "these modules are never observed transmitting on this bus
+segment under any circumstance this project has tested" -- real driving,
+every triggered action, two full active address sweeps. Doesn't rule out
+direction 1 (DoIP) or a bus segment this OBD-II tap genuinely can't see,
+but it's a meaningfully stronger negative than active addressing alone.
+Re-run `python tools/can_id_triage.py <captures...> --dict
+captures/fabia_2026/signal_dictionary.json --check-ids <ids>` against any
+future capture to keep this check current without re-deriving it by hand.
+
+**UPDATE 2026-09-20 -- a real architectural explanation found, upgrading
+"unreachable" from a guess to a physically-grounded theory.** VW's own
+2010 Polo SSP (ssp444, referenced via
+[P1kachu/talking-with-cars](https://github.com/P1kachu/talking-with-cars/blob/master/notes/vw-polo-r6.txt),
+same MQB-A0 platform family as this Fabia) documents the Polo's CAN buses
+split **by physical bitrate**: Drive/Diagnosis at 500 kbit/s, but
+**Comfort/Infotainment at 100 kbit/s** -- a genuinely separate physical
+bus segment, since two bitrates can't coexist on one wire pair. Checked
+both our boards: P4/MCP2515 (`mcp2515.c` `CNF1/2/3_500KBPS_8MHZ`) and
+S3/native TWAI (`bringup_s3.c` `TWAI_TIMING_CONFIG_500KBITS()`) are both
+hardcoded to 500 kbit/s only -- neither has ever attempted to listen on a
+100 kbit/s bus.
+
+If the Fabia is wired the same way (unconfirmed, but same platform
+family), this reframes the whole body-module result: it's very unlikely
+the OBD-II connector's CAN_H/CAN_L pins (6/14) expose the Comfort bus at
+all -- they most plausibly carry only the Drive/Diagnosis bus. The
+Gateway (`0x710`) being the only thing that ever answers isn't
+necessarily "gatekeeping" the Comfort bus over the same wire -- it's more
+likely the only node with a physical link to *both* buses, bridging
+between them only via UDS routing (session/security-gated), never raw
+frame forwarding. That would explain both negative results at once: zero
+UDS responses (routing blocked) AND zero passive broadcasts (wrong bus
+entirely, not just wrong addressing).
+
+**CORRECTION, same day, a bit later: the "we need a second physical CAN
+interface" practical implication above is wrong.** Checked how real
+diagnostic tools actually work: Ross-Tech's VCDS (the standard VAG tool)
+and OEM VAS/ODIS tools all connect through the single standard OBD-II
+connector -- no second interface, no extra wiring. This works because the
+Central Gateway architecture is specifically designed so **one diagnostic
+connection can reach every internal bus segment**, including Comfort --
+the Gateway does the CAN-to-CAN routing internally; the tool just sends a
+normally-addressed UDS request and the Gateway forwards it to whichever
+bus segment the target module lives on. A second physical tap is not how
+any real tool does this, professional or otherwise.
+
+So the bitrate-segmentation finding above is still very likely correct as
+an architectural fact (Comfort probably is a separate 100 kbit/s bus,
+unreachable by direct wire from OBD-II) -- but the conclusion to draw
+from it is different: **reaching those modules is a routing/protocol
+problem to solve on the existing single interface, not a hardware
+problem.** Our UDS requests to the body-module addresses aren't
+triggering the Gateway's routing, for some reason a real tool's requests
+presumably would. Per the session's own already-tried list above,
+`0x10 0x03` session-control-first didn't help (6/6 still timed out on
+2026-09-15) and SFD was ruled out -- so this remains an open question,
+not a newly solved one. Doesn't change the ranked candidate list from
+the "Reframed question" section above (wrong CAN IDs for this specific
+model/year is still the most likely explanation, then a transport-format
+mismatch); it just rules out "we're on the wrong physical bus and need
+new hardware" as the fix. Corrected before it became the basis for
+buying/wiring anything.

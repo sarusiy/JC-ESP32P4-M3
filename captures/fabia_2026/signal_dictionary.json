@@ -1,0 +1,142 @@
+{
+  "_readme": [
+    "Persistent, structured record of what's actually known about this car's CAN traffic -- the reusable output of every reverse-engineering session, instead of re-deriving context from prose docs each time.",
+    "This file is read by tools/can_id_triage.py to filter already-known IDs out of its ranked 'worth investigating' report. It is NOT written automatically by that script -- entries are added/edited by hand (or by Claude on request) only once a finding is actually confirmed, to avoid polluting it with unverified guesses.",
+    "id keys are uppercase hex with a 0x prefix, e.g. \"0x7E8\". Use the shortest form for the addressing scheme actually used (11-bit standard vs 29-bit extended) -- don't zero-pad.",
+    "kind: one of uds_diagnostic | obd_request | obd_response | broadcast_decoded | broadcast_undecoded | unknown",
+    "confidence: one of confirmed | candidate | present_confirmed (id/payload seen and stable, but meaning not decoded) | unconfirmed",
+    "signals: list of {name, byte_offset, length, endian, scale, offset, unit, notes} for anything actually decoded at the byte level. Leave empty ([]) until something is confirmed -- most entries below are intentionally signal-less right now."
+  ],
+  "car": "fabia_2026",
+  "schema_version": 1,
+  "updated": "2026-09-20",
+  "ids": {
+    "0x7DF": {
+      "label": "OBD-II Mode 01 functional request (standard 11-bit)",
+      "kind": "obd_request",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-13",
+      "notes": "This car answers on the classic 0x7DF/0x7E8-0x7EF range, not 29-bit extended, despite other bus traffic (0x17F00010, 0x1BFC8202) using 29-bit IDs.",
+      "signals": []
+    },
+    "0x7E8": {
+      "label": "Engine ECU (OBD Mode 01/09 response)",
+      "kind": "obd_response",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-13",
+      "notes": "Real engine ECU -- richer PID support (17 PIDs page 1: 01,03,04,05,06,07,0B,0C,0D,0E,0F,11,13,15,1C,1F,20; 9 PIDs page 2: 21,2E,2F,30,31,33,34,3C,40). RPM/speed/throttle live-confirmed tracking real acceleration. VIN (Mode 09 PID 02) confirmed: TMBER9PJ3T4015474. Decode formulas are standard OBD Mode 01 (see main.c obd_print_response), not raw fixed-offset broadcast signals, so not itemized in 'signals' below.",
+      "signals": []
+    },
+    "0x7E9": {
+      "label": "Secondary/gateway module (OBD Mode 01 response, mirrors a subset of engine signals)",
+      "kind": "obd_response",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-13",
+      "notes": "Narrower PID support (7 PIDs page 1: 01,04,05,0C,0D,0F,20; 2 PIDs page 2: 33,40). Values track 0x7E8's within 1-3%, not stale/frozen. Responder-lock in obd_query_task picks 0x7E8 first and ignores this one for the rest of a PID sequence.",
+      "signals": []
+    },
+    "0x710": {
+      "label": "Gateway (UDS diagnostic)",
+      "kind": "uds_diagnostic",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-15",
+      "notes": "Only address that responds across a full 0x700-0x7FF UDS sweep. Identifies itself as supplier 'Har', part '3Q0'. Not a broadcast signal source -- point-to-point diagnostic only.",
+      "signals": []
+    },
+    "0x77A": {
+      "label": "Gateway UDS response (see 0x710)",
+      "kind": "uds_diagnostic",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-20",
+      "notes": "The Gateway's own response id, captured passively during the 2026-09-15 address-scan session. Not a separate module -- same node as 0x710.",
+      "signals": []
+    },
+    "0x70D": {
+      "label": "Central Convenience / Comfort System -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x777. Times out on direct 0x10/0x22 UDS requests. Unconfirmed whether it broadcasts unprompted -- check via passive capture before assuming fully unreachable.",
+      "signals": []
+    },
+    "0x71E": {
+      "label": "Lock Electronics -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x788. Times out on direct 0x10/0x22 UDS requests.",
+      "signals": []
+    },
+    "0x74A": {
+      "label": "Driver Door -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x7B4. Times out on direct 0x10/0x22 UDS requests.",
+      "signals": []
+    },
+    "0x74B": {
+      "label": "Passenger Door -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x7B5. Times out on direct 0x10/0x22 UDS requests.",
+      "signals": []
+    },
+    "0x73E": {
+      "label": "Rear Driver Door -- candidate body module (untested)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x7A8. Lower priority than the others -- not yet UDS-tested at all per UDS_BODY_MODULE_RESEARCH.md.",
+      "signals": []
+    },
+    "0x73F": {
+      "label": "Rear Passenger Door -- candidate body module (untested)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x7A9. Lower priority than the others -- not yet UDS-tested at all per UDS_BODY_MODULE_RESEARCH.md.",
+      "signals": []
+    },
+    "0x754": {
+      "label": "Headlight Regulation -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x7BE. Times out on direct 0x10/0x22 UDS requests.",
+      "signals": []
+    },
+    "0x730": {
+      "label": "High Beam Assist -- candidate body module (unreachable via direct UDS)",
+      "kind": "uds_diagnostic",
+      "confidence": "candidate",
+      "notes": "Response id 0x79A. Times out on direct 0x10/0x22 UDS requests.",
+      "signals": []
+    },
+    "0x714": {
+      "label": "Instrument cluster (Dash Board) -- reference only, not part of body-module research goal",
+      "kind": "uds_diagnostic",
+      "confidence": "unconfirmed",
+      "notes": "Response id 0x77E. Listed for cross-reference, not actively pursued.",
+      "signals": []
+    },
+    "0x78F": {
+      "label": "Closed dead lead -- do not re-pursue",
+      "kind": "uds_diagnostic",
+      "confidence": "confirmed",
+      "confirmed_date": "2026-09-16",
+      "notes": "Response id 0x7F9 replied '7F 10 31' (negative response to Diagnostic Session Control -- 'service not supported'). Investigated and closed; removed from UdsTargets.java. Kept here so it isn't rediscovered and re-investigated from scratch.",
+      "signals": []
+    },
+    "0x17F00010": {
+      "label": "Dominant comfort/body heartbeat broadcast (29-bit extended, undecoded)",
+      "kind": "broadcast_undecoded",
+      "confidence": "present_confirmed",
+      "confirmed_date": "2026-09-13",
+      "notes": "Present continuously, including with the car fully off and doors closed -- not tied to any specific triggered action (lock/unlock/door/headlights all showed only this ID in early Learn-wizard captures, before Active-mode testing ruled it out as the signal for any of them). Real rate ~2Hz in Active mode (Passive/Listen-Only mode falsely inflates it to ~730-750Hz via CAN auto-retransmit-on-no-ACK -- always analyze Active-mode captures for rate, never Passive). Payload is not fixed across sessions (seen: 20020000852A05D6, 2000000000000780). Treat as background noise and filter out of ID-triage ranking; a real signal (if one exists) for lock/unlock/etc. is more likely elsewhere or in a longer capture.",
+      "signals": []
+    },
+    "0x1BFC8202": {
+      "label": "Secondary background broadcast (29-bit extended, undecoded)",
+      "kind": "broadcast_undecoded",
+      "confidence": "present_confirmed",
+      "confirmed_date": "2026-09-13",
+      "notes": "~6.17s period. Payload seen: 8800000D00000000. Only visible in Active mode -- was being crowded out of the MCP2515's 2-deep hardware RX buffer by the 0x17F00010 no-ACK retransmit storm in Passive mode, never appeared in any Passive capture. Undecoded; filter out of ID-triage ranking alongside 0x17F00010 unless byte-liveness analysis finds something worth a closer look.",
+      "signals": []
+    }
+  }
+}
