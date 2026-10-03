@@ -499,6 +499,8 @@ Now it exposes the same companion service as the P4 build: service `0xFFF0`, `0x
 
 Verified from the watch app (`watch/` in the CarTheftGuard repo): connect, `freq 1000/500/250/100` all acknowledged `OK`, LED rate changes. The watch only connects with full 128-bit UUIDs and pairing disabled.
 
+**Two simultaneous BLE clients** (phone app + watch): connectable advertising stops while a client is connected, so the GAP handler now restarts it after each connect while fewer than `BLE_MAX_CLIENTS` (2, a deliberate cap below the NimBLE limit of 3) are connected, and replies go only to the client that wrote the command. With both slots taken the board stops advertising. The LED rate itself is shared (last writer wins). Verified with the phone app and watch connected together.
+
 ## Open questions still remaining
 
 - Final confirmation that GPIO4/5 (CAN TX/RX) and GPIO6/7 (GPS UART) are

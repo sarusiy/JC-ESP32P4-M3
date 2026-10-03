@@ -1660,8 +1660,34 @@ static void start_wifi_ap(void)
 #define BLE_RESPONSE_CHAR_UUID     0xFFF2
 
 static uint16_t s_ble_response_handle;
-static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static char s_ble_response[96] = "Ready\r\n";
+
+/* Connectable advertising stops while a client is connected, so the handler
+ * below restarts it after each connect as long as a slot is free. That lets
+ * the phone app and the watch be connected at the same time. Capped at 2
+ * deliberately; with both slots taken the board stops advertising. */
+#define BLE_MAX_CLIENTS 2
+_Static_assert(BLE_MAX_CLIENTS <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
+               "BLE_MAX_CLIENTS exceeds the NimBLE connection limit");
+static uint16_t s_ble_conns[BLE_MAX_CLIENTS];
+static int s_ble_conn_count;
+
+static void ble_conn_add(uint16_t handle)
+{
+    if (s_ble_conn_count < BLE_MAX_CLIENTS) {
+        s_ble_conns[s_ble_conn_count++] = handle;
+    }
+}
+
+static void ble_conn_remove(uint16_t handle)
+{
+    for (int i = 0; i < s_ble_conn_count; i++) {
+        if (s_ble_conns[i] == handle) {
+            s_ble_conns[i] = s_ble_conns[--s_ble_conn_count];
+            return;
+        }
+    }
+}
 
 static void ble_start_advertising(void);
 
@@ -1681,12 +1707,6 @@ static int ble_response_read_cb(uint16_t conn_handle, uint16_t attr_handle,
 static void ble_publish_response(uint16_t conn_handle, const char *message)
 {
     snprintf(s_ble_response, sizeof(s_ble_response), "%s", message);
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        conn_handle = s_ble_conn_handle;
-    }
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
     int rc = ble_gatts_notify(conn_handle, s_ble_response_handle);
     if (rc != 0) {
         ESP_LOGW(TAG, "BLE response notify not sent: rc=%d", rc);
@@ -1745,18 +1765,22 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
-        ESP_LOGI(TAG, "BLE connect: status=%d handle=%d",
-                 event->connect.status, (int)event->connect.conn_handle);
         if (event->connect.status == 0) {
-            s_ble_conn_handle = event->connect.conn_handle;
-        } else {
+            ble_conn_add(event->connect.conn_handle);
+        }
+        ESP_LOGI(TAG, "BLE connect: status=%d handle=%d clients=%d/%d",
+                 event->connect.status, (int)event->connect.conn_handle,
+                 s_ble_conn_count, BLE_MAX_CLIENTS);
+        if (s_ble_conn_count < BLE_MAX_CLIENTS) {
             ble_start_advertising();
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "BLE disconnect: reason=%d (0x%x)",
-                 event->disconnect.reason, event->disconnect.reason);
-        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        ble_conn_remove(event->disconnect.conn.conn_handle);
+        ESP_LOGI(TAG, "BLE disconnect: reason=%d (0x%x) handle=%d clients=%d/%d",
+                 event->disconnect.reason, event->disconnect.reason,
+                 (int)event->disconnect.conn.conn_handle,
+                 s_ble_conn_count, BLE_MAX_CLIENTS);
         ble_start_advertising();
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
