@@ -1,0 +1,594 @@
+(kicad_sch
+	(version 20250114)
+	(generator "eeschema")
+	(generator_version "9.0")
+	(uuid "517ca73d-5780-4e66-b3f1-8edb55b57dbe")
+	(paper "A4")
+	(title_block
+		(title "Relay remote control + ignition-sense addon")
+		(date "2026-09-23")
+		(rev "A")
+		(comment 1 "Separate sheet from bringup_wiring.kicad_sch -- optocoupler-isolated GPIO->relay-remote button driver. Safety interlock is CAN-bus RPM only (firmware), no ignition-sense hardware.")
+		(comment 2 "Run Inspect > Electrical Rules Checker before trusting this netlist.")
+	)
+	(lib_symbols
+		(symbol "Device:R"
+			(pin_numbers (hide yes))
+			(pin_names (offset 0))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "R" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
+			(property "Value" "R" (at 0 0 90) (effects (font (size 1.27 1.27))))
+			(symbol "R_0_1"
+				(rectangle (start -1.016 -2.54) (end 1.016 2.54) (stroke (width 0.254) (type default)) (fill (type none)))
+			)
+			(symbol "R_1_1"
+				(pin passive line (at 0 3.81 270) (length 1.27) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at 0 -3.81 90) (length 1.27) (name "~" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Diode"
+			(pin_numbers (hide yes))
+			(pin_names (offset 0))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "D" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
+			(property "Value" "1N4148" (at 0 0 90) (effects (font (size 1.27 1.27))))
+			(symbol "Diode_0_1"
+				(rectangle (start -1.016 -2.54) (end 1.016 2.54) (stroke (width 0.254) (type default)) (fill (type none)))
+			)
+			(symbol "Diode_1_1"
+				(pin passive line (at 0 3.81 270) (length 1.27) (name "A" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at 0 -3.81 90) (length 1.27) (name "K" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Conn_01x02"
+			(pin_numbers (hide yes))
+			(pin_names (offset 1.016) (hide yes))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "J" (at 0 3.81 0) (effects (font (size 1.27 1.27))))
+			(property "Value" "Conn_01x02" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))
+			(symbol "Conn_01x02_0_1"
+				(rectangle (start -1.27 -2.54) (end 1.27 2.54) (stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "Conn_01x02_1_1"
+				(pin passive line (at -5.08 1.27 0) (length 3.81) (name "Pin_1" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -1.27 0) (length 3.81) (name "Pin_2" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Conn_01x04"
+			(pin_numbers (hide yes))
+			(pin_names (offset 1.016) (hide yes))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "J" (at 0 6.35 0) (effects (font (size 1.27 1.27))))
+			(property "Value" "Conn_01x04" (at 0 -6.35 0) (effects (font (size 1.27 1.27))))
+			(symbol "Conn_01x04_0_1"
+				(rectangle (start -1.27 -5.08) (end 1.27 5.08) (stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "Conn_01x04_1_1"
+				(pin passive line (at -5.08 3.81 0) (length 3.81) (name "Pin_1" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 1.27 0) (length 3.81) (name "Pin_2" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -1.27 0) (length 3.81) (name "Pin_3" (effects (font (size 1.27 1.27)))) (number "3" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -3.81 0) (length 3.81) (name "Pin_4" (effects (font (size 1.27 1.27)))) (number "4" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Conn_01x05"
+			(pin_numbers (hide yes))
+			(pin_names (offset 1.016) (hide yes))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "J" (at 0 7.62 0) (effects (font (size 1.27 1.27))))
+			(property "Value" "Conn_01x05" (at 0 -7.62 0) (effects (font (size 1.27 1.27))))
+			(symbol "Conn_01x05_0_1"
+				(rectangle (start -1.27 -6.35) (end 1.27 6.35) (stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "Conn_01x05_1_1"
+				(pin passive line (at -5.08 5.08 0) (length 3.81) (name "Pin_1" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 2.54 0) (length 3.81) (name "Pin_2" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 0 0) (length 3.81) (name "Pin_3" (effects (font (size 1.27 1.27)))) (number "3" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -2.54 0) (length 3.81) (name "Pin_4" (effects (font (size 1.27 1.27)))) (number "4" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -5.08 0) (length 3.81) (name "Pin_5" (effects (font (size 1.27 1.27)))) (number "5" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Conn_01x06"
+			(pin_numbers (hide yes))
+			(pin_names (offset 1.016) (hide yes))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "J" (at 0 8.89 0) (effects (font (size 1.27 1.27))))
+			(property "Value" "Conn_01x06" (at 0 -8.89 0) (effects (font (size 1.27 1.27))))
+			(symbol "Conn_01x06_0_1"
+				(rectangle (start -1.27 -7.62) (end 1.27 7.62) (stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "Conn_01x06_1_1"
+				(pin passive line (at -5.08 6.35 0) (length 3.81) (name "Pin_1" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 3.81 0) (length 3.81) (name "Pin_2" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 1.27 0) (length 3.81) (name "Pin_3" (effects (font (size 1.27 1.27)))) (number "3" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -1.27 0) (length 3.81) (name "Pin_4" (effects (font (size 1.27 1.27)))) (number "4" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -3.81 0) (length 3.81) (name "Pin_5" (effects (font (size 1.27 1.27)))) (number "5" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -6.35 0) (length 3.81) (name "Pin_6" (effects (font (size 1.27 1.27)))) (number "6" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+		(symbol "Local:Optocoupler6"
+			(pin_numbers (hide yes))
+			(pin_names (offset 1.016) (hide yes))
+			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(property "Reference" "U" (at 0 8.89 0) (effects (font (size 1.27 1.27))))
+			(property "Value" "Optocoupler (6-pin)" (at 0 -8.89 0) (effects (font (size 1.27 1.27))))
+			(symbol "Optocoupler6_0_1"
+				(rectangle (start -1.27 -6.35) (end 1.27 6.35) (stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "Optocoupler6_1_1"
+				(pin passive line (at -5.08 5.08 0) (length 3.81) (name "Anode" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 0 0) (length 3.81) (name "Cathode" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at -5.08 -5.08 0) (length 3.81) (name "NC" (effects (font (size 1.27 1.27)))) (number "3" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at 5.08 -5.08 180) (length 3.81) (name "Emitter" (effects (font (size 1.27 1.27)))) (number "4" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at 5.08 0 180) (length 3.81) (name "Collector" (effects (font (size 1.27 1.27)))) (number "5" (effects (font (size 1.27 1.27)))))
+				(pin passive line (at 5.08 5.08 180) (length 3.81) (name "Base" (effects (font (size 1.27 1.27)))) (number "6" (effects (font (size 1.27 1.27)))))
+			)
+			(embedded_fonts no)
+		)
+	)
+
+	(symbol
+		(lib_id "Local:Conn_01x04")
+		(at 40 50 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "3e7b967d-21bc-4dad-93b7-92ef3198b0a6")
+		(property "Reference" "J5" (at 35 40 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "S3 GPIO breakout (15/16) + 5V + GND" (at 40 62 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "d5eb1cc4-2b53-4242-ac22-f1c29088c57f"))
+		(pin "2" (uuid "9aa3dd67-2232-4ac3-af17-4517b1bf9448"))
+		(pin "3" (uuid "a6fc3b45-9083-4e67-adff-202c06bf928b"))
+		(pin "4" (uuid "ab697f1e-ccc2-4f19-a62f-ac751e41e09f"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "J5")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 70 44 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "8c96b1d6-a516-4503-9d4b-283f2ea0736d")
+		(property "Reference" "R3" (at 73 41 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "220R" (at 73 47 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "00eda928-f027-43cd-9004-b266fe314d43"))
+		(pin "2" (uuid "030579a8-9984-415b-baa2-8ffd9ca45759"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "R3")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 70 60 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "2d7f809f-69a3-428b-9c4a-7fff483195ba")
+		(property "Reference" "R4" (at 73 57 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "220R" (at 73 63 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "c2b708c1-63ca-4044-8239-c4874fdac01b"))
+		(pin "2" (uuid "1591a41c-7024-4a02-ab45-98418c3fe827"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "R4")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Optocoupler6")
+		(at 90 44 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "a4285db4-2ece-421d-b4a2-43137eca60e6")
+		(property "Reference" "U1" (at 87 34 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "Relay button A driver" (at 90 55 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "65fb01a7-1c64-4f1e-b382-e66b4f942361"))
+		(pin "2" (uuid "91e4f575-fc64-4017-8085-bb99e32ad992"))
+		(pin "3" (uuid "d1225163-fbdb-4dfd-95bf-1cd2e85fe649"))
+		(pin "4" (uuid "8a0ca811-60f2-4c21-a287-feb03d26e808"))
+		(pin "5" (uuid "22ad254c-5529-4584-a23e-569bd3fed3f1"))
+		(pin "6" (uuid "7653c78c-2b32-44af-96df-6d02d03f3b06"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "U1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Optocoupler6")
+		(at 90 60 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "89f46e7c-e714-40ef-a85e-805461c647f1")
+		(property "Reference" "U2" (at 87 50 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "Relay button B driver" (at 90 71 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "8e4dee40-f015-428b-a226-4333d3cba79c"))
+		(pin "2" (uuid "c8ae644f-ee2b-47ed-9bdf-5c6cb689ef2a"))
+		(pin "3" (uuid "8b911d79-d3c6-4797-8e84-349ad514e76d"))
+		(pin "4" (uuid "46494b7d-489a-4e67-abd8-e5b2b6c8f932"))
+		(pin "5" (uuid "5305ca88-78e1-4d61-ab07-e11b0336a8bb"))
+		(pin "6" (uuid "d24a0802-2c55-4742-ad3d-e2d52b85b98a"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "U2")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Conn_01x02")
+		(at 115 44 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "0f7cea11-0f7a-4ebb-b5db-027689ec6989")
+		(property "Reference" "J6" (at 118 39 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "Remote board: button A contacts" (at 118 50 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "83594589-19f5-4872-a415-0270d3d2e8e6"))
+		(pin "2" (uuid "8f76906c-1d90-48f1-88cc-58994b711a81"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "J6")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Conn_01x02")
+		(at 115 60 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "83682c28-d261-4410-ad8e-defba7ab885e")
+		(property "Reference" "J7" (at 118 55 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "Remote board: button B contacts" (at 118 66 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "e0c8c261-9c91-41ed-a17f-128dd38a22ca"))
+		(pin "2" (uuid "ffbefa63-acf0-4d94-862e-def53f9f8e2d"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "J7")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Conn_01x02")
+		(at 40 120 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "c1a9b02c-63e8-4b8c-aab8-34c368b26127")
+		(property "Reference" "J9" (at 35 115 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "5V->12V boost converter, IN" (at 40 126 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "0c92cb14-600e-41a6-952b-0bc9020bc0ca"))
+		(pin "2" (uuid "793d841d-276f-4910-b02a-28423a8cf662"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "J9")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Local:Conn_01x02")
+		(at 70 120 0)
+		(unit 1)
+		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+		(uuid "5e448564-7261-4e62-a561-543ce90af120")
+		(property "Reference" "J10" (at 73 115 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "Boost converter OUT -> remote board power" (at 73 126 0) (effects (font (size 1.27 1.27))))
+		(pin "1" (uuid "ae800236-55a0-4ddd-9c4b-0f010eb083ab"))
+		(pin "2" (uuid "b5f798f9-0da7-4753-8f85-a0c5afd1efd3"))
+		(instances
+			(project "relay_ignition_control"
+				(path "/517ca73d-5780-4e66-b3f1-8edb55b57dbe"
+					(reference "J10")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(wire
+		(pts (xy 34.92 46.19) (xy 32.38 46.19))
+		(stroke (width 0) (type solid))
+		(uuid "905772b8-1182-4fa1-89c2-7b37c73197e2")
+	)
+	(wire
+		(pts (xy 34.92 48.73) (xy 32.38 48.73))
+		(stroke (width 0) (type solid))
+		(uuid "b9a6a790-39be-45d7-aabb-5873bccf5eeb")
+	)
+	(wire
+		(pts (xy 34.92 51.27) (xy 32.38 51.27))
+		(stroke (width 0) (type solid))
+		(uuid "8653dfc2-734d-4f29-a342-bff706e43ad0")
+	)
+	(wire
+		(pts (xy 34.92 53.81) (xy 32.38 53.81))
+		(stroke (width 0) (type solid))
+		(uuid "8c0ba7d8-99d6-494b-ad19-6609661779fc")
+	)
+	(wire
+		(pts (xy 70 40.19) (xy 70 42.73))
+		(stroke (width 0) (type solid))
+		(uuid "0c96fd68-fd95-40b7-8aa3-5789ddae7f51")
+	)
+	(wire
+		(pts (xy 70 47.81) (xy 70 45.27))
+		(stroke (width 0) (type solid))
+		(uuid "e42ad8da-b3bc-43c6-9ddc-fbffbd9a03a2")
+	)
+	(wire
+		(pts (xy 70 56.19) (xy 70 58.73))
+		(stroke (width 0) (type solid))
+		(uuid "fcff1e0d-98f2-438b-9e8a-8209545a922a")
+	)
+	(wire
+		(pts (xy 70 63.81) (xy 70 61.27))
+		(stroke (width 0) (type solid))
+		(uuid "3150240f-a1a1-4c1c-9787-f6306bd24a55")
+	)
+	(wire
+		(pts (xy 84.92 38.92) (xy 82.38 38.92))
+		(stroke (width 0) (type solid))
+		(uuid "ef8bfbd4-19c7-4c60-b890-3e08728ec465")
+	)
+	(wire
+		(pts (xy 84.92 44) (xy 82.38 44))
+		(stroke (width 0) (type solid))
+		(uuid "2f117801-43d6-411d-96f2-ba0fd4f5134b")
+	)
+	(wire
+		(pts (xy 95.08 49.08) (xy 97.62 49.08))
+		(stroke (width 0) (type solid))
+		(uuid "f6ab75ad-2251-4611-b802-a44b324a99cd")
+	)
+	(wire
+		(pts (xy 95.08 44) (xy 97.62 44))
+		(stroke (width 0) (type solid))
+		(uuid "6c9292bc-342a-427c-aa33-50bb0d9e3742")
+	)
+	(wire
+		(pts (xy 84.92 54.92) (xy 82.38 54.92))
+		(stroke (width 0) (type solid))
+		(uuid "2ea42c08-1dda-40f6-a0a2-52749dfc84d3")
+	)
+	(wire
+		(pts (xy 84.92 60) (xy 82.38 60))
+		(stroke (width 0) (type solid))
+		(uuid "548f6833-3963-4949-b50b-4f887ee0356d")
+	)
+	(wire
+		(pts (xy 95.08 65.08) (xy 97.62 65.08))
+		(stroke (width 0) (type solid))
+		(uuid "c75a6616-a703-4539-99fe-b76f42106308")
+	)
+	(wire
+		(pts (xy 95.08 60) (xy 97.62 60))
+		(stroke (width 0) (type solid))
+		(uuid "0f97c9fd-f441-45cb-8a49-84159fc12db6")
+	)
+	(wire
+		(pts (xy 109.92 42.73) (xy 107.38 42.73))
+		(stroke (width 0) (type solid))
+		(uuid "53eedb37-9743-45e4-9cb9-dcf7bc5b82b4")
+	)
+	(wire
+		(pts (xy 109.92 45.27) (xy 107.38 45.27))
+		(stroke (width 0) (type solid))
+		(uuid "b0b84512-86f8-4d8c-910a-dbc8d3815766")
+	)
+	(wire
+		(pts (xy 109.92 58.73) (xy 107.38 58.73))
+		(stroke (width 0) (type solid))
+		(uuid "3dbb90e0-6151-4a32-877c-ea9d16e39b88")
+	)
+	(wire
+		(pts (xy 109.92 61.27) (xy 107.38 61.27))
+		(stroke (width 0) (type solid))
+		(uuid "a84696dd-292e-40ce-a2b1-b43e8fa67611")
+	)
+	(wire
+		(pts (xy 34.92 118.73) (xy 32.38 118.73))
+		(stroke (width 0) (type solid))
+		(uuid "f9ad2587-d6a2-43a2-ba3d-045751781c82")
+	)
+	(wire
+		(pts (xy 34.92 121.27) (xy 32.38 121.27))
+		(stroke (width 0) (type solid))
+		(uuid "8d283ab0-c47a-40bc-8e17-f15bb4ffdd04")
+	)
+	(wire
+		(pts (xy 64.92 118.73) (xy 62.38 118.73))
+		(stroke (width 0) (type solid))
+		(uuid "66e49ff2-716c-4e57-9e3f-32db54bb5b61")
+	)
+	(wire
+		(pts (xy 64.92 121.27) (xy 62.38 121.27))
+		(stroke (width 0) (type solid))
+		(uuid "7834cb77-e56f-4eec-bf40-fb4df015f088")
+	)
+	(label "GPIO15"
+		(at 32.38 46.19 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "e19a2f00-d030-45c5-bef2-950fac2d5ed7")
+	)
+	(label "GPIO16"
+		(at 32.38 48.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "4c2e443c-d727-4e26-9a49-db79559cea17")
+	)
+	(label "5V"
+		(at 32.38 51.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "b56ee33a-7ffa-44b2-9b61-2d15dfd9066e")
+	)
+	(label "GND"
+		(at 32.38 53.81 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "31a9b205-ea4d-405a-97b3-4be90eb7a7f8")
+	)
+	(label "GPIO15"
+		(at 70 42.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "6a15370a-0c82-4c32-b5a7-7bf0fd1aded5")
+	)
+	(label "OPTO_A_ANODE"
+		(at 70 45.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "cf09cedf-6682-4c15-8440-18a9e21ec788")
+	)
+	(label "GPIO16"
+		(at 70 58.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "b1501769-4511-47be-bd50-057aca3722c1")
+	)
+	(label "OPTO_B_ANODE"
+		(at 70 61.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "63465be7-0c94-4cf5-a3af-32b444884e92")
+	)
+	(label "OPTO_A_ANODE"
+		(at 82.38 38.92 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "62c63de2-367e-427c-bf9d-d3bff5add66c")
+	)
+	(label "GND"
+		(at 82.38 44 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "61d1cb9e-9152-4f3c-831f-a533eb354ae5")
+	)
+	(label "BTN_A_1"
+		(at 97.62 49.08 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "46b81dd8-35b7-4995-918f-e54f1fa880d9")
+	)
+	(label "BTN_A_2"
+		(at 97.62 44 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "92e5b0ab-4988-4254-b68f-01f0a961b4ed")
+	)
+	(label "OPTO_B_ANODE"
+		(at 82.38 54.92 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "776d6705-6340-407b-b9d5-94dd1572c7b0")
+	)
+	(label "GND"
+		(at 82.38 60 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "4d39db4e-e847-40f3-abb6-8e35511f58a0")
+	)
+	(label "BTN_B_1"
+		(at 97.62 65.08 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "9464925d-6ef3-4ae8-ac78-52041e50be12")
+	)
+	(label "BTN_B_2"
+		(at 97.62 60 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "f8756df7-3fef-4f8b-8726-8afe74d01edb")
+	)
+	(label "BTN_A_1"
+		(at 107.38 42.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "045b90be-1353-4812-8935-6a20b8a76391")
+	)
+	(label "BTN_A_2"
+		(at 107.38 45.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "79cef53a-7d68-47c6-8240-6e6afe2420ce")
+	)
+	(label "BTN_B_1"
+		(at 107.38 58.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "a9e8cfba-5072-4b2e-bf79-bdeb3873c619")
+	)
+	(label "BTN_B_2"
+		(at 107.38 61.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "9d8054b6-1263-4114-8f74-ff97e6c12cac")
+	)
+	(label "5V"
+		(at 32.38 118.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "97d5259b-5787-4460-8a44-86c6cf18f492")
+	)
+	(label "GND"
+		(at 32.38 121.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "629a55cd-cbd7-4429-91db-df184ad7aab2")
+	)
+	(label "REMOTE_12V"
+		(at 62.38 118.73 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "17baeaab-b34b-4109-bd57-29b45496fb8b")
+	)
+	(label "CAR_GND"
+		(at 62.38 121.27 0)
+		(effects (font (size 1.27 1.27)) (justify left bottom))
+		(uuid "10766524-9c9b-4348-868f-1eed667477dc")
+	)
+	(no_connect
+		(at 84.92 49.08)
+		(uuid "b8d76cca-f0a3-4c4b-ac10-19b8d002b244")
+	)
+	(no_connect
+		(at 95.08 38.92)
+		(uuid "d1707ce7-0075-4414-a103-200649c7964c")
+	)
+	(no_connect
+		(at 84.92 65.08)
+		(uuid "c45b887b-d29b-4778-aa34-1961a190ba81")
+	)
+	(no_connect
+		(at 95.08 54.92)
+		(uuid "d3d289b0-62b0-461f-9ade-c4ca30f282b3")
+	)
+	(text "R3/R4 = 220R: sized for the S3's 3.3V GPIO driving U1/U2's LED side (~6-10mA)."
+		(at 30 20 0)
+		(effects (font (size 1.27 1.27)))
+		(uuid "5c0cf3d2-f4db-498d-a07b-2648df8cbe45")
+	)
+	(text "U1/U2 pins 3 and 6 intentionally not connected (NC/Base), matching the datasheet's simple-switch usage."
+		(at 30 25 0)
+		(effects (font (size 1.27 1.27)))
+		(uuid "7aa679f7-5885-4074-8ef7-b1149a41db3f")
+	)
+	(text "Safety interlock is CAN-bus RPM only (relay_safe_to_actuate() in firmware, existing OBD/CAN link) -- no ignition-sense hardware on this sheet."
+		(at 30 30 0)
+		(effects (font (size 1.27 1.27)))
+		(uuid "dd1a2cba-ad74-46eb-bbe3-407aadba097b")
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)
+

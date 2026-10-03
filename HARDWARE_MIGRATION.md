@@ -63,12 +63,25 @@ Instruments SN65HVD230 chip, pin-compatible with the more common
 PCA82C250). 3.3V native (matches the S3's I/O voltage directly, no level
 shifting needed — unlike 5V transceivers), ESD protected. 4-pin header
 (3.3V, GND, RX, TX) for the microcontroller side, screw terminal (CANH,
-CANL) for the bus side, plus an onboard jumper for the 120Ω termination
-resistor (leave it **open/removed** when tapping into a car's OBD-II bus
-mid-span — see [[project-real-car-realism]] and
-[[project-uds-vwtp-body-module-research]] on why adding termination at an
-OBD-II tap is wrong; only needed if this board is ever the true end of an
-isolated bench bus).
+CANL) for the bus side, plus a **fixed onboard 120Ω termination resistor**
+(NOT jumper-controlled on this module -- an earlier note here said
+jumper; the real board was measured at ~60Ω against the simulator, i.e.
+its resistor in parallel with the simulator's own, see the entry further
+down). It must be **removed** when tapping into a car's OBD-II or
+Quadlock CAN mid-span -- see [[project-real-car-realism]] and
+[[project-uds-vwtp-body-module-research]] on why adding termination at a
+tap is wrong; only needed if this board is ever the true end of an
+isolated bench bus.
+
+**Termination decision (2026-10-02)**: remove (desolder/lift one end of)
+the onboard 120Ω SMD resistor next to the CANH/CANL screw terminal, and
+wire an external 120Ω resistor on a 2-pin header/jumper across
+CANH/CANL instead. Fit the jumper on the bench (simulator J1 closed +
+this one = correct 60Ω two-node bus); leave it off on the car. Lift,
+don't cut -- reversible. Check: unpowered, module alone should read
+~120Ω across CANH/CANL before the change and open after; on the car the
+bus should read ~60Ω with the S3 connected (~40Ω means a stray
+terminator is still fitted).
 
 ## Migration plan (draft — not yet started)
 
@@ -477,6 +490,14 @@ The app's **Monitor** tab calls `fetchObdData()` -> `GET /api/obd`, which didn't
 **Shortcut that works for the simulator specifically**: `ArdunioUsbBridgeToCan` already broadcasts engine/vehicle state *unsolicited* on `0x120` (every 20ms) and `0x180` (every 50ms) regardless of any active OBD-II request -- this is exactly what `JC-ESP32P4-M3`'s `decode_engine_broadcast`/`decode_vehicle_broadcast` already decode into the same `obd_state_t` fields Mode 01 PID responses would. Ported those two functions verbatim into `bringup_s3.c`, hooked into `capture_can_frame()` (checks `message->identifier` against `CAN_ID_ENGINE_STATE`/`CAN_ID_VEHICLE_STATE`, decodes if it matches), and added `obd_http_handler`/`GET /api/obd` with the same JSON contract as the P4. No CAN TX, no request/response queue, no active polling needed. `supported_pids`/`supported_pids_2` stay `0` (those only come from an active PID 0x00/0x20 request) -- everything else (RPM, speed, coolant, throttle) updates live. Verified end-to-end: app connects, Monitor tab shows live data.
 
 This only works because the simulator broadcasts unsolicited -- a real car won't, so this is explicitly a simulator-only shortcut. The full active `obd_query_task` port (needed for any real-car testing on this board) is still open, tracked below.
+
+## BLE control service added for the Amazfit watch app (2026-10-03)
+
+`bringup_s3.c` used to advertise `JC-P4-C6` with no GATT service and no GAP event callback. Two consequences: nothing to talk to over BLE (the LED rate was only settable via `POST /api/frequency` on the SoftAP), and a connected or failed-to-connect peripheral never resumed advertising, so the board vanished from scans after the first attempt.
+
+Now it exposes the same companion service as the P4 build: service `0xFFF0`, `0xFFF1` write `freq <ms>` (shared `apply_freq_command`), `0xFFF2` read/notify with the `OK freq=<ms> ms` / `ERR ...` reply. A GAP event handler logs connect/disconnect (with reason code), subscribe, MTU and encryption events and restarts advertising after a disconnect or failed connect. The advertising packet also carries the 0xFFF0 service UUID.
+
+Verified from the watch app (`watch/` in the CarTheftGuard repo): connect, `freq 1000/500/250/100` all acknowledged `OK`, LED rate changes. The watch only connects with full 128-bit UUIDs and pairing disabled.
 
 ## Open questions still remaining
 
