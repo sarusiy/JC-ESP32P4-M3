@@ -46,11 +46,14 @@
 #include "led_strip.h"
 #include "driver/twai.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 static const char *TAG = "bringup";
 
@@ -86,6 +89,114 @@ static void obd_query_task(void *arg);
 #define BLE_DEVICE_NAME "JC-P4-C6"
 #define BLINK_HALF_PERIOD_MIN_MS 10
 #define BLINK_HALF_PERIOD_MAX_MS 60000
+
+/* Remote-control relay board integration (starter/fuel-pump/etc. cutoff --
+ * see HARDWARE_MIGRATION.md project notes): these two GPIOs each drive an
+ * optocoupler wired across one button's contacts on an off-the-shelf 433MHz
+ * remote (the remote's own board, powered separately via a 5V->12V boost
+ * converter from this board's 5V rail, keeps doing the actual RF work --
+ * we're just electrically simulating a finger press). GPIO high -> LED
+ * side of the optocoupler lights -> phototransistor conducts -> shorts the
+ * button's two contacts, same as a real press. Chosen as safe general-
+ * purpose pins per the same constraints as CAN_TX/RX_GPIO above: not
+ * strapping (0/3/45/46), not USB (19/20), not PSRAM (35/36/37), not GPS
+ * (6/7) or CAN (4/5) or LED (48). Button A = both relays on, Button B =
+ * both relays off, per the physical remote's own labeling -- this firmware
+ * has no idea which real-world state (immobilized vs. normal) that
+ * corresponds to; that depends entirely on how the relays end up wired
+ * into the car (NC vs. NO) and is intentionally not assumed here. */
+#define RELAY_BUTTON_A_GPIO 15
+#define RELAY_BUTTON_B_GPIO 16
+#define RELAY_BUTTON_PRESS_MS 250
+/* Safety interlock: never actuate the relays while the engine could be
+ * running -- these cut the starter/fuel-pump/etc., which must only ever
+ * happen parked, not while driving. Requires BOTH a fresh (recent) RPM
+ * reading AND that reading being exactly 0 -- deliberately fails CLOSED
+ * (refuses) if OBD polling isn't currently succeeding, rather than
+ * silently allowing it just because the last-known RPM happened to be 0.
+ * CAN mode must be Active for this to ever pass (Passive/Listen-Only never
+ * transmits the Mode 01 requests this depends on). */
+#define RELAY_RPM_STALE_US (5 * 1000 * 1000)
+
+/* In-cabin audio deterrent: 2x MAX98357A (one per channel, Left/Right
+ * selected by each board's own SD-pin resistor -- see
+ * QUADLOCK_MEDIA_TAP.md, not something firmware controls) sharing one
+ * I2S bus, feeding the front speakers through a low-level-trigger 2ch
+ * relay module (both channels tied to the same trigger GPIO so they
+ * always switch together). GPIOs chosen against the same constraints as
+ * everywhere else in this file: not strapping/USB/PSRAM, and not
+ * CAN(4/5)/GPS(6/7)/relay-buttons(15/16)/video-select(17)/LED(48). */
+#define DETERRENT_I2S_BCLK_GPIO 9
+#define DETERRENT_I2S_LRCLK_GPIO 10
+#define DETERRENT_I2S_DOUT_GPIO 11
+/* Low-level-trigger relay module (see RELAY_REMOTE_CONTROL.md-style
+ * relay notes): HIGH = idle = NC = factory radio (safe default), LOW =
+ * active = NO = this deterrent's own audio. Default HIGH at boot. */
+#define DETERRENT_RELAY_GPIO 12
+#define DETERRENT_SAMPLE_RATE_HZ 16000
+/* "Yelp" siren pattern -- two tones alternating quickly, deliberately
+ * harder to tune out psychologically than a single steady tone. */
+#define DETERRENT_TONE_LOW_HZ 800.0
+#define DETERRENT_TONE_HIGH_HZ 1400.0
+#define DETERRENT_YELP_SWITCH_MS 150
+#define DETERRENT_AMPLITUDE 20000
+
+/* Video switcher select line (see VIDEO_SWITCHER_HARNESS notes): drives
+ * the relay/mux that picks which of two analog composite sources
+ * (dashcam rear camera vs. factory reverse camera) reaches the head
+ * unit's video input. GPIO chosen against the same constraints as
+ * everywhere else in this file: not strapping/USB/PSRAM, and free of
+ * CAN(4/5)/GPS(6/7)/deterrent(9/10/11/12)/relay-buttons(15/16)/LED(48).
+ * Was previously reserved for an ignition-sense line that no longer
+ * exists (that safety check is CAN-RPM-only now), so it was free. */
+#define VIDEO_SELECT_GPIO 17
+
+/* Central disable points (see Skoda_Fabia_IV_Workshop_Manual_2022-2023_INDEX.md,
+ * "J965..." and "Central locking (SC6)..." sections) -- two fuse-tap
+ * relays on the real Fabia, both physically in Fuse holder C behind the
+ * driver's-side dash, both switched by these two GPIOs together on
+ * arm/disarm:
+ *   SC48 (7.5A) -- kills the start button (E378/J965 chain).
+ *   SC6  (40A)  -- kills all four doors' central-locking actuation.
+ * Each relay is wired NC-safe (de-energized = fuse circuit intact = car
+ * behaves normally) -- these GPIOs go HIGH only while armed/parked, and
+ * must go LOW (restoring both fuses) before the car can be driven. Same
+ * RPM==0 safety interlock as RELAY_BUTTON_A/B_GPIO applies here --
+ * default state matters far more for SC6/SC48 than for the old
+ * remote-button relays, since these directly gate the car's own start
+ * and door-lock circuits, not a simulated key-fob press. GPIOs chosen
+ * against the same constraints as everywhere else in this file: not
+ * strapping/USB/PSRAM, and free of CAN(4/5)/GPS(6/7)/deterrent
+ * (9/10/11/12)/relay-buttons(15/16)/video-select(17)/LED(48). */
+#define SC48_TAP_RELAY_GPIO 18
+#define SC6_TAP_RELAY_GPIO 21
+
+/* Cellular (GPRS/LTE) uplink -- mandatory, not optional: lets the app
+ * arm/disarm and monitor from anywhere with coverage, not just near the
+ * car (BLE/SoftAP range only). Module talks over plain UART AT commands,
+ * same pattern as GPS_UART_PORT above but on UART_NUM_2 (GPS already
+ * owns UART_NUM_1). PWRKEY needs a low pulse (~1-2s per module
+ * datasheet) to power the module on -- it is NOT a logic level like the
+ * other relay GPIOs here. GPIOs chosen against the same constraints as
+ * everywhere else in this file: not strapping/USB/PSRAM, and free of
+ * CAN(4/5)/GPS(6/7)/deterrent(9/10/11/12)/relay-buttons(15/16)/
+ * video-select(17)/SC48(18)/SC6(21)/LED(48). */
+#define GPRS_UART_TX_GPIO 13
+#define GPRS_UART_RX_GPIO 14
+#define GPRS_PWRKEY_GPIO 38
+#define GPRS_UART_PORT UART_NUM_2
+#define GPRS_BAUD 115200
+/* Design rule: cellular is additive, never a dependency. BLE + SoftAP
+ * (local, near-range) must keep working fully with the module absent,
+ * unpowered, SIM-less, or simply out of coverage -- this task owns its
+ * own FreeRTOS task so a stuck/registering modem never blocks CAN, BLE,
+ * or the SC48/SC6 relay logic. Relay GPIO state is just a level the S3
+ * holds; it does not depend on network state at all, so a mid-session
+ * cellular drop leaves whatever armed/disarmed state was already set
+ * (fail-in-place, not fail-open or fail-closed). Local API should expose
+ * a cellular status (registered / no SIM / no coverage) so the app can
+ * tell in advance whether remote monitoring will work, without that
+ * status gating anything else. */
 
 static led_strip_handle_t s_led;
 static volatile uint32_t s_blink_half_period_ms = 500;
@@ -132,6 +243,11 @@ typedef struct {
 
 static obd_state_t s_obd_state;
 static portMUX_TYPE s_obd_lock = portMUX_INITIALIZER_UNLOCKED;
+/* Last time s_obd_state.rpm was actually updated from a real CAN frame --
+ * used by the relay safety gate (see RELAY_RPM_STALE_US) to tell "engine
+ * confirmed off" apart from "we simply haven't heard anything in a while",
+ * which must NOT be treated as safe. */
+static int64_t s_obd_rpm_updated_us;
 
 /* --- Active OBD-II / UDS engine, ported from JC-ESP32P4-M3 (see that
  * file's equivalent structs/functions for the original doc comments this
@@ -269,6 +385,7 @@ static void decode_engine_broadcast(const uint8_t *data, uint8_t dlc)
     s_obd_state.rpm = rpm_raw / 4;
     s_obd_state.coolant_c = coolant_c;
     s_obd_state.throttle_pct = throttle_pct;
+    s_obd_rpm_updated_us = esp_timer_get_time();
     portEXIT_CRITICAL(&s_obd_lock);
 }
 
@@ -311,6 +428,7 @@ static void obd_print_response(uint8_t pid, const uint8_t *buf, uint8_t len)
             if (len >= 5) {
                 portENTER_CRITICAL(&s_obd_lock);
                 s_obd_state.rpm = ((unsigned)buf[3] * 256 + buf[4]) / 4;
+                s_obd_rpm_updated_us = esp_timer_get_time();
                 portEXIT_CRITICAL(&s_obd_lock);
             }
             break;
@@ -877,6 +995,227 @@ static void route_can_frame(const twai_message_t *message)
     }
 }
 
+static void relay_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << RELAY_BUTTON_A_GPIO) | (1ULL << RELAY_BUTTON_B_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+    /* Idle low -- optocoupler LED off, button contacts open, same as the
+     * remote sitting untouched. */
+    gpio_set_level(RELAY_BUTTON_A_GPIO, 0);
+    gpio_set_level(RELAY_BUTTON_B_GPIO, 0);
+    ESP_LOGI(TAG, "Relay remote control ready: button A=GPIO%d, button B=GPIO%d",
+             RELAY_BUTTON_A_GPIO, RELAY_BUTTON_B_GPIO);
+}
+
+static void relay_press_button(int gpio_num)
+{
+    gpio_set_level(gpio_num, 1);
+    vTaskDelay(pdMS_TO_TICKS(RELAY_BUTTON_PRESS_MS));
+    gpio_set_level(gpio_num, 0);
+}
+
+/* See RELAY_RPM_STALE_US's doc comment. out_rpm/out_age_ms are for the
+ * rejection message, not used when this returns true. */
+static bool relay_safe_to_actuate(uint16_t *out_rpm, int64_t *out_age_ms)
+{
+    portENTER_CRITICAL(&s_obd_lock);
+    uint16_t rpm = s_obd_state.rpm;
+    int64_t updated_us = s_obd_rpm_updated_us;
+    portEXIT_CRITICAL(&s_obd_lock);
+
+    int64_t age_us = esp_timer_get_time() - updated_us;
+    *out_rpm = rpm;
+    *out_age_ms = age_us / 1000;
+    return updated_us != 0 && age_us >= 0 && age_us < RELAY_RPM_STALE_US && rpm == 0;
+}
+
+/* Body (plain text): "on" (button A -- both relays on) or "off" (button B
+ * -- both relays off), per the physical remote's own labeling. See this
+ * file's RELAY_BUTTON_A/B_GPIO doc comment for why this firmware doesn't
+ * attempt to know which real-world state that corresponds to. Refuses
+ * (HTTP 409) unless relay_safe_to_actuate() confirms the engine is off --
+ * see RELAY_RPM_STALE_US. */
+static esp_err_t relay_http_handler(httpd_req_t *request)
+{
+    char body[8] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected on or off");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    int gpio_num;
+    if (strcmp(body, "on") == 0) {
+        gpio_num = RELAY_BUTTON_A_GPIO;
+    } else if (strcmp(body, "off") == 0) {
+        gpio_num = RELAY_BUTTON_B_GPIO;
+    } else {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected on or off");
+        return ESP_FAIL;
+    }
+
+    uint16_t rpm = 0;
+    int64_t age_ms = 0;
+    if (!relay_safe_to_actuate(&rpm, &age_ms)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Refused: rpm=%u last_update=%lldms ago (need fresh 0)",
+                 rpm, (long long)age_ms);
+        ESP_LOGW(TAG, "Relay request refused: %s", msg);
+        httpd_resp_set_status(request, "409 Conflict");
+        httpd_resp_set_type(request, "text/plain");
+        httpd_resp_sendstr(request, msg);
+        return ESP_OK;
+    }
+
+    relay_press_button(gpio_num);
+    ESP_LOGI(TAG, "Relay button pressed: %s (GPIO%d)", body, gpio_num);
+    httpd_resp_set_type(request, "text/plain");
+    httpd_resp_sendstr(request, body[1] == 'n' ? "OK on" : "OK off");
+    return ESP_OK;
+}
+
+/* In-cabin audio deterrent -- see DETERRENT_* doc comment above and
+ * QUADLOCK_MEDIA_TAP.md for the hardware side (2x MAX98357A, front-
+ * speaker relay). s_deterrent_task is non-NULL exactly while the tone
+ * generator loop is running; deterrent_stop() only requests the stop
+ * (clears s_deterrent_active) -- the task itself does the actual
+ * cleanup (I2S disable, relay back to idle) once its loop notices and
+ * exits, so the relay is never flipped mid-write. */
+static i2s_chan_handle_t s_deterrent_i2s_tx;
+static TaskHandle_t s_deterrent_task;
+static volatile bool s_deterrent_active;
+
+static void deterrent_relay_init(void)
+{
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << DETERRENT_RELAY_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+    gpio_set_level(DETERRENT_RELAY_GPIO, 1); /* idle: NC, factory radio */
+}
+
+static void deterrent_i2s_init(void)
+{
+    i2s_chan_config_t chan_config = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_config, &s_deterrent_i2s_tx, NULL));
+
+    i2s_std_config_t std_config = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(DETERRENT_SAMPLE_RATE_HZ),
+        /* MAX98357A requires standard (Philips) I2S framing, not MSB-justified. */
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = DETERRENT_I2S_BCLK_GPIO,
+            .ws = DETERRENT_I2S_LRCLK_GPIO,
+            .dout = DETERRENT_I2S_DOUT_GPIO,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_deterrent_i2s_tx, &std_config));
+    ESP_LOGI(TAG, "Deterrent I2S ready: BCLK=GPIO%d LRCLK=GPIO%d DOUT=GPIO%d relay=GPIO%d",
+             DETERRENT_I2S_BCLK_GPIO, DETERRENT_I2S_LRCLK_GPIO, DETERRENT_I2S_DOUT_GPIO,
+             DETERRENT_RELAY_GPIO);
+}
+
+static void deterrent_task(void *arg)
+{
+    const int samples_per_write = 256;
+    int16_t buffer[256 * 2]; /* stereo interleaved, same value both channels */
+    double phase = 0.0;
+    double freq_hz = DETERRENT_TONE_LOW_HZ;
+    bool high_tone = false;
+    int64_t last_switch_us = esp_timer_get_time();
+
+    while (s_deterrent_active) {
+        int64_t now = esp_timer_get_time();
+        if (now - last_switch_us >= DETERRENT_YELP_SWITCH_MS * 1000) {
+            high_tone = !high_tone;
+            freq_hz = high_tone ? DETERRENT_TONE_HIGH_HZ : DETERRENT_TONE_LOW_HZ;
+            last_switch_us = now;
+        }
+        for (int i = 0; i < samples_per_write; i++) {
+            int16_t sample = (int16_t)(sin(phase) * DETERRENT_AMPLITUDE);
+            buffer[i * 2] = sample;
+            buffer[i * 2 + 1] = sample;
+            phase += 2.0 * M_PI * freq_hz / DETERRENT_SAMPLE_RATE_HZ;
+            if (phase >= 2.0 * M_PI) {
+                phase -= 2.0 * M_PI;
+            }
+        }
+        size_t written = 0;
+        i2s_channel_write(s_deterrent_i2s_tx, buffer, sizeof(buffer), &written, portMAX_DELAY);
+    }
+
+    i2s_channel_disable(s_deterrent_i2s_tx);
+    gpio_set_level(DETERRENT_RELAY_GPIO, 1); /* back to idle: NC, factory radio */
+    ESP_LOGI(TAG, "Deterrent stopped, relay back to factory radio");
+    s_deterrent_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void deterrent_start(void)
+{
+    if (s_deterrent_task != NULL) {
+        return; /* already running */
+    }
+    s_deterrent_active = true;
+    gpio_set_level(DETERRENT_RELAY_GPIO, 0); /* active: NO, this system's audio */
+    ESP_ERROR_CHECK(i2s_channel_enable(s_deterrent_i2s_tx));
+    xTaskCreatePinnedToCore(deterrent_task, "deterrent", 4096, NULL, 5, &s_deterrent_task, 1);
+    ESP_LOGI(TAG, "Deterrent started");
+}
+
+static void deterrent_stop(void)
+{
+    /* Actual relay/I2S cleanup happens inside deterrent_task once it
+     * notices s_deterrent_active went false -- see its doc comment. */
+    s_deterrent_active = false;
+}
+
+/* Body (plain text): "on" or "off". Continuous yelp-siren playback
+ * through the front speakers while "on"; "off" (or never having been
+ * turned on) leaves the speakers on the factory radio via the relay's
+ * idle/NC state. */
+static esp_err_t deterrent_http_handler(httpd_req_t *request)
+{
+    char body[8] = {0};
+    int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected on or off");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    if (strcmp(body, "on") == 0) {
+        deterrent_start();
+    } else if (strcmp(body, "off") == 0) {
+        deterrent_stop();
+    } else {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected on or off");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(request, "text/plain");
+    httpd_resp_sendstr(request, body);
+    return ESP_OK;
+}
+
 /* Same parsing/response contract as JC-ESP32P4-M3's apply_freq_command --
  * see this file's top doc comment. */
 static bool apply_freq_command(const char *line, char *out_msg, size_t out_msg_len)
@@ -1219,6 +1558,16 @@ static void start_http_server(void)
         .method = HTTP_GET,
         .handler = deep_scan_status_http_handler,
     };
+    httpd_uri_t relay_uri = {
+        .uri = "/api/relay",
+        .method = HTTP_POST,
+        .handler = relay_http_handler,
+    };
+    httpd_uri_t deterrent_uri = {
+        .uri = "/api/deterrent",
+        .method = HTTP_POST,
+        .handler = deterrent_http_handler,
+    };
     httpd_register_uri_handler(server, &frequency_uri);
     httpd_register_uri_handler(server, &gps_uri);
     httpd_register_uri_handler(server, &can_uri);
@@ -1227,8 +1576,11 @@ static void start_http_server(void)
     httpd_register_uri_handler(server, &can_mode_uri);
     httpd_register_uri_handler(server, &deep_scan_start_uri);
     httpd_register_uri_handler(server, &deep_scan_status_uri);
+    httpd_register_uri_handler(server, &relay_uri);
+    httpd_register_uri_handler(server, &deterrent_uri);
     ESP_LOGI(TAG, "HTTP API ready: POST /api/frequency, GET /api/gps, GET /api/can?after=<seq>, GET /api/obd, "
-             "GET /api/can/partner, POST /api/can/mode, GET|POST /api/deepscan");
+             "GET /api/can/partner, POST /api/can/mode, GET|POST /api/deepscan, POST /api/relay, "
+             "POST /api/deterrent");
 }
 
 /* BLE+WiFi concurrency was tested exhaustively and abandoned -- see
@@ -1300,13 +1652,153 @@ static void start_wifi_ap(void)
     start_http_server();
 }
 
+/* Same companion GATT contract as JC-ESP32P4-M3's main.c: write "freq <ms>"
+ * to 0xFFF1, read/notify the "OK freq=<ms> ms" / "ERR ..." reply on 0xFFF2.
+ * The watch app (and nRF Connect) use this; the phone app uses HTTP. */
+#define BLE_COMPANION_SERVICE_UUID 0xFFF0
+#define BLE_COMPANION_CHAR_UUID    0xFFF1
+#define BLE_RESPONSE_CHAR_UUID     0xFFF2
+
+static uint16_t s_ble_response_handle;
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static char s_ble_response[96] = "Ready\r\n";
+
+static void ble_start_advertising(void);
+
+static int ble_response_read_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return os_mbuf_append(ctxt->om, s_ble_response, strlen(s_ble_response)) == 0
+               ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static void ble_publish_response(uint16_t conn_handle, const char *message)
+{
+    snprintf(s_ble_response, sizeof(s_ble_response), "%s", message);
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        conn_handle = s_ble_conn_handle;
+    }
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    int rc = ble_gatts_notify(conn_handle, s_ble_response_handle);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "BLE response notify not sent: rc=%d", rc);
+    }
+}
+
+static int ble_freq_write_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)attr_handle;
+    (void)arg;
+    char cmd[64] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len >= sizeof(cmd)) {
+        len = sizeof(cmd) - 1;
+    }
+    if (ble_hs_mbuf_to_flat(ctxt->om, cmd, len, NULL) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    cmd[len] = '\0';
+
+    char msg[96];
+    bool ok = apply_freq_command(cmd, msg, sizeof(msg));
+    ESP_LOGI(TAG, "BLE cmd '%s' -> %s", cmd, ok ? "OK" : "ERR");
+    ble_publish_response(conn_handle, msg);
+    return 0;
+}
+
+static const struct ble_gatt_svc_def s_gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(BLE_COMPANION_SERVICE_UUID),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(BLE_COMPANION_CHAR_UUID),
+                .access_cb = ble_freq_write_cb,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid = BLE_UUID16_DECLARE(BLE_RESPONSE_CHAR_UUID),
+                .access_cb = ble_response_read_cb,
+                .val_handle = &s_ble_response_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {0},
+        },
+    },
+    {0},
+};
+
+/* Without this callback NimBLE never tells us a link ended, and a connected
+ * (or failed-to-connect) peripheral does not resume advertising on its own --
+ * the board used to vanish from scans after the first connection attempt. */
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        ESP_LOGI(TAG, "BLE connect: status=%d handle=%d",
+                 event->connect.status, (int)event->connect.conn_handle);
+        if (event->connect.status == 0) {
+            s_ble_conn_handle = event->connect.conn_handle;
+        } else {
+            ble_start_advertising();
+        }
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "BLE disconnect: reason=%d (0x%x)",
+                 event->disconnect.reason, event->disconnect.reason);
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        ble_start_advertising();
+        break;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        ble_start_advertising();
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        ESP_LOGI(TAG, "BLE subscribe: attr=%d notify=%d",
+                 (int)event->subscribe.attr_handle, (int)event->subscribe.cur_notify);
+        break;
+    case BLE_GAP_EVENT_MTU:
+        ESP_LOGI(TAG, "BLE MTU update: %d", (int)event->mtu.value);
+        break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        ESP_LOGI(TAG, "BLE encryption change: status=%d", event->enc_change.status);
+        break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+    default:
+        break;
+    }
+    return 0;
+}
+
 static void ble_start_advertising(void)
 {
+    if (ble_gap_adv_active()) {
+        return;
+    }
+    static const ble_uuid16_t svc_uuid = BLE_UUID16_INIT(BLE_COMPANION_SERVICE_UUID);
     struct ble_hs_adv_fields fields = {0};
     fields.name = (const uint8_t *)BLE_DEVICE_NAME;
     fields.name_len = strlen(BLE_DEVICE_NAME);
     fields.name_is_complete = 1;
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.uuids16 = &svc_uuid;
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
@@ -1322,7 +1814,7 @@ static void ble_start_advertising(void)
      * was tried during the coex investigation and never definitively
      * proven to help (it didn't fix DHCP with BLE active either), so
      * don't carry a deviation from the known-good config without reason. */
-    rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, NULL, NULL);
+    rc = ble_gap_adv_start(s_ble_addr_type, NULL, BLE_HS_FOREVER, &adv, ble_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE adv start failed: rc=%d", rc);
         return;
@@ -1355,6 +1847,17 @@ static void start_ble(void)
         return;
     }
     ble_svc_gap_init();
+    ble_svc_gatt_init();
+    rc = ble_gatts_count_cfg(s_gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE gatts_count_cfg failed: rc=%d", rc);
+        return;
+    }
+    rc = ble_gatts_add_svcs(s_gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE gatts_add_svcs failed: rc=%d", rc);
+        return;
+    }
     ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
@@ -1804,6 +2307,9 @@ void app_main(void)
      * see s_can_capture's doc comment) -- kept anyway since freeing CPU0
      * for WiFi/BLE is sound practice regardless and costs nothing. */
     sensors_init_on_core1();
+    relay_init();
+    deterrent_relay_init();
+    deterrent_i2s_init();
     start_wifi_ap();
     start_ble();
 
