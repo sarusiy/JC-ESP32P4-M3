@@ -615,3 +615,69 @@ worth confirming against the actual car), and ideally comparing its real
 connector against the wiring diagrams in the linked harness repos before
 attempting a splice, since none of this has been visually verified
 against a 2026 Fabia specifically yet.
+
+## UPDATE 2026-10-07: OSS reference survey -- gateway routing is a real wall, not a missed trick
+
+Prompted by "don't reinvent the wheel -- are there GitHub/other projects
+showing how to get through the gateway?" Surveyed the open-source VAG
+diagnostics landscape. The headline conclusion: **reading DIDs from the
+responding address (our Gateway, 0x710) is well-precedented and needs no
+Security Access, but routing *through* the gateway to an otherwise-silent
+sub-module is NOT solved by any hobbyist OSS project found.** The tools
+that do it (VCDS/ODIS) rely on proprietary gateway routing knowledge.
+This is a genuine wall, not an obvious step we overlooked.
+
+### Comparison table -- what each reference solved vs. where we are
+
+| Project | Platform | Reads DIDs from responding addr (no SecAccess)? | Routes *through* gateway to a silent sub-module? | Best to borrow |
+|---|---|---|---|---|
+| **Ours** (JC-ESP32P4-M3 / S3) | Fabia IV, MQB-A0 | YES -- 0x710 reads `0xF197`="GW", `0xF193`="Har", `0xF187`="3Q0" | NO -- only 0x710 ever answers across 209,958 frames | -- |
+| [aep/vag_reverse_engineering](https://github.com/aep/vag_reverse_engineering/blob/master/LOG.md) | VW (gen unspecified) | YES -- reads battery SoC DID 0x1DD0 via `765 03 22 1D D0`, no SecAccess | NO -- reads from the one responding addr, same as us | Concrete read pattern; **padding byte 0x55**; confirms +0x6A resp offset |
+| [masini1491/esp32-vag-data-server](https://github.com/masini1491/esp32-vag-data-server) | **Kamiq 2024, MQB-A0** (near-twin) | Architecture only -- vehicle validation still Pending | NO -- "VAG runtime routing -- not yet started" | Structural peer on same chip+platform; watch/collaborate |
+| [pylessard/python-udsoncan](https://github.com/pylessard/python-udsoncan) + can-isotp | Generic (PC) | N/A (library) | N/A (library) | **Correct ISO-TP + TesterPresent + addressing reference** -- the thing Gemini's code lacked |
+| VW_Flash (bri3d) | VAG MQB flashing | YES (session/transport) | Partially -- real session+routing, but it's a *write/flash* tool | Transport/session layer only; NOT the write/flash parts |
+| [esp32_tp20_datalogger](https://github.com/xerootg/esp32_tp20_datalogger) | VW, TP 2.0 | Via older VWTP 2.0, not UDS | NO | Reference for our stalled VWTP 2.0 scan path |
+| openpilot / [hardybm/comma-J533-harness](https://github.com/hardybm/comma-J533-harness) | VAG MQB | N/A | **Sidesteps it** -- physical in-line splice at J533's own connector | The real-world "give up on OBD routing, tap J533 directly" precedent (see section above) |
+
+### Two independent confirmations worth locking in as fact
+- **Reads of some DIDs need no Security Access** -- us (0xF1xx from 0x710)
+  AND aep (0x1DD0 battery SoC). Security Access is a *write* gate.
+- **The +0x6A request->response offset** we use is corroborated by aep's
+  0x765->0x7CF. Padding filler byte convention there is **0x55**.
+
+### Actionable next step chosen: adopt a proper ISO-TP layer
+
+The gap between our code and a "real tool" is not the high-level UDS
+services -- it's the **transport layer underneath** them (ISO-TP /
+ISO 15765-2). Gemini's snippet, and arguably our own request/response
+paths, treat a UDS exchange as a single 8-byte CAN frame. That only works
+for the shortest messages. The Installation List, a full DID read, or any
+multi-module routing reply are **multi-frame**, and without ISO-TP flow
+control they fail. Plan:
+
+1. **Reference, don't vendor**: study `pylessard/python-udsoncan` +
+   `can-isotp` for the correct state machine, but implement in C on the
+   S3 (can't run Python on the board). Keep it read-only.
+2. **Implement the 4 ISO-TP frame types** the current code ignores:
+   - **SF** (Single Frame, PCI high-nibble `0x0`) -- what we already send.
+   - **FF** (First Frame, `0x1`) -- first chunk of a long *response*; its
+     low nibble + next byte give the total length.
+   - **CF** (Consecutive Frame, `0x2`) -- the rest, with a 4-bit rolling
+     sequence counter we must track.
+   - **FC** (Flow Control, `0x3`) -- **the piece we're missing**: after we
+     receive an FF, *we* must send `30 00 00` (Clear-To-Send, block
+     size 0, min separation 0) or the ECU stops after the first frame.
+3. **Reassemble** FF+CF into the full UDS payload before parsing, and
+   **segment** any outbound request >7 bytes into FF+CF (not needed for
+   our short reads yet, but required if we ever send longer requests).
+4. **Add cyclic TesterPresent (0x3E 0x80)** every ~2s to hold any
+   extended session open while reading.
+5. **Only then** retry the real experiment: a `0x22` DID read aimed at a
+   *specific sub-module's* diagnostic ID (not a blind sweep) with full
+   ISO-TP + TesterPresent, to test whether the Gateway bridges it. This
+   is the first attempt that has the transport correct enough to tell a
+   genuine "Gateway won't route" from "our framing was just too naive."
+
+This stays entirely on the read side -- no Security Access, no writes.
+It's the honest prerequisite before concluding the Gateway truly won't
+route: right now a multi-frame reply would fail even if routing worked.
